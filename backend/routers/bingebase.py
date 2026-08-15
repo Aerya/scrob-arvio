@@ -51,23 +51,25 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
 
             logger.info("Bingebase push job %s: queued %s watched items.", job_id, total_items)
 
-            processed_so_far = 0
-            for i, event in enumerate(events, 1):
-                if event.media:
-                    await _maybe_bingebase_scrobble(settings, event.media, "stop", 1.0, db=db)
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as http_client:
+                processed_so_far = 0
+                for i, event in enumerate(events, 1):
+                    if event.media:
+                        await _maybe_bingebase_scrobble(settings, event.media, "stop", 1.0, db=db, client=http_client, is_push=True)
 
-                processed_so_far = i
-                if i % 10 == 0 or i == total_items:
-                    await db.execute(
-                        update(SyncJob).where(SyncJob.id == job_id).values(processed_items=processed_so_far)
-                    )
-                    await db.commit()
-                    await _raise_if_cancelled(db, job_id)
+                    processed_so_far = i
+                    if i % 10 == 0 or i == total_items:
+                        await db.execute(
+                            update(SyncJob).where(SyncJob.id == job_id).values(processed_items=processed_so_far)
+                        )
+                        await db.commit()
+                        await _raise_if_cancelled(db, job_id)
 
-                if i % 100 == 0 or i == total_items:
-                    logger.info("Bingebase push job %s: %s/%s items pushed", job_id, i, total_items)
+                    if i % 100 == 0 or i == total_items:
+                        logger.info("Bingebase push job %s: %s/%s items pushed", job_id, i, total_items)
 
-                await asyncio.sleep(0.02)  # Slight delay to avoid overwhelming webhook server
+                    await asyncio.sleep(0.01)
 
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(

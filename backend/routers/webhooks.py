@@ -221,13 +221,18 @@ async def _maybe_bingebase_scrobble(
     action: str,
     progress_percent: float,
     db: AsyncSession | None = None,
+    client: Any | None = None,
+    is_push: bool = False,
 ) -> None:
     """Forward a play/pause/stop event to Bingebase Webhook URL. Errors are swallowed."""
-    if not (settings and settings.bingebase_scrobble and settings.bingebase_webhook_url):
+    if not (settings and settings.bingebase_webhook_url):
+        return
+    if not is_push and not settings.bingebase_scrobble:
         return
 
     try:
         import httpx
+        import logging
         from sqlalchemy import inspect as sa_inspect
 
         progress = min(100.0, round(progress_percent * 100, 1))
@@ -268,8 +273,20 @@ async def _maybe_bingebase_scrobble(
         if settings.bingebase_api_key:
             headers["Authorization"] = f"Bearer {settings.bingebase_api_key}"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(settings.bingebase_webhook_url, json=payload, headers=headers)
+        should_close = False
+        http_client = client
+        if http_client is None:
+            http_client = httpx.AsyncClient(timeout=10.0)
+            should_close = True
+
+        try:
+            resp = await http_client.post(settings.bingebase_webhook_url, json=payload, headers=headers)
+            status_code = getattr(resp, "status_code", 200)
+            if isinstance(status_code, int) and status_code >= 400:
+                logging.getLogger(__name__).warning("[Bingebase scrobble] HTTP %s from webhook: %s", status_code, str(getattr(resp, "text", ""))[:200])
+        finally:
+            if should_close:
+                await http_client.aclose()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("[Bingebase scrobble] %s failed: %s", action, exc)
