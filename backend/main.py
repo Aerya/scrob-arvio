@@ -39,8 +39,9 @@ async def _auto_sync_scheduler():
     from routers.trakt import run_trakt_sync, _run_trakt_push
     from routers.simkl import run_simkl_sync, _run_simkl_push
     from routers.mdblist import run_mdblist_sync, run_mdblist_push
+    from routers.bingebase import run_bingebase_sync, run_bingebase_push
 
-    # Trakt/Simkl/MDBList are single, user-level cloud connections (no
+    # Trakt/Simkl/MDBList/Bingebase are single, user-level cloud connections (no
     # MediaServerConnection row, no connection_id) — same due-date logic as
     # the media-connection loop below, just keyed by user_id + source alone.
     cloud_sync_config = [
@@ -75,6 +76,15 @@ async def _auto_sync_scheduler():
             ),
             "pull_runner": run_mdblist_sync,
             "push_runner": run_mdblist_push,
+        },
+        {
+            "source": CollectionSource.bingebase,
+            "connected_field": "bingebase_webhook_url",
+            "auto_sync_field": "bingebase_auto_sync_interval",
+            "auto_push_field": "bingebase_auto_push_interval",
+            "push_flags": ("bingebase_push_watched", "bingebase_push_ratings"),
+            "pull_runner": run_bingebase_sync,
+            "push_runner": run_bingebase_push,
         },
     ]
 

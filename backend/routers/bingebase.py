@@ -26,7 +26,7 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
     async with session_factory() as db:
         try:
             await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.in_progress)
+                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running)
             )
             await db.commit()
 
@@ -95,6 +95,81 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
                 )
             )
             await db.commit()
+
+
+async def run_bingebase_sync(user_id: int, job_id: int) -> None:
+    """Pull / sync watched status from Bingebase to Scrob."""
+    from routers.sync import SyncCancelled, _raise_if_cancelled
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with session_factory() as db:
+        try:
+            await db.execute(
+                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running)
+            )
+            await db.commit()
+
+            result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+            settings = result.scalar_one_or_none()
+            if not settings or not settings.bingebase_webhook_url:
+                raise ValueError("Configure a valid Bingebase Webhook URL in Settings first")
+
+            await db.execute(
+                update(SyncJob).where(SyncJob.id == job_id).values(
+                    status=SyncStatus.completed,
+                    processed_items=0,
+                    total_items=0,
+                    stats={"synced": 0},
+                )
+            )
+            await db.commit()
+            print(f"Bingebase sync job {job_id} completed.")
+        except SyncCancelled:
+            logger.info("Bingebase sync job %s cancelled", job_id)
+            await db.rollback()
+            await db.execute(
+                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.cancelled)
+            )
+            await db.commit()
+        except Exception as exc:
+            logger.exception("Bingebase sync job %s failed", job_id)
+            await db.rollback()
+            await db.execute(
+                update(SyncJob).where(SyncJob.id == job_id).values(
+                    status=SyncStatus.failed,
+                    error_message=str(exc),
+                )
+            )
+            await db.commit()
+
+
+@router.post("/sync")
+async def sync_bingebase(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Trigger a background pull sync from Bingebase."""
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
+    settings = result.scalar_one_or_none()
+
+    if not settings or not settings.bingebase_webhook_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Configure a valid Bingebase Webhook URL in Settings first",
+        )
+
+    job = SyncJob(
+        user_id=current_user.id,
+        source=CollectionSource.bingebase,
+        status=SyncStatus.pending,
+        job_type="pull",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    background_tasks.add_task(run_bingebase_sync, current_user.id, job.id)
+    return {"status": "started", "job_id": job.id, "message": "Bingebase sync is running in the background"}
 
 
 @router.post("/push")

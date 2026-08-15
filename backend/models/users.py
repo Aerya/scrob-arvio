@@ -146,9 +146,14 @@ class UserSettings(Base):
     # Bingebase integration
     bingebase_webhook_url: Mapped[Optional[str]] = mapped_column(String(500))
     bingebase_api_key: Mapped[Optional[str]] = mapped_column(String(255))
+    bingebase_sync_watched: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     bingebase_scrobble: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     bingebase_push_watched: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     bingebase_push_ratings: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+    # Bingebase auto sync/push interval, in hours (null = disabled)
+    bingebase_auto_sync_interval: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bingebase_auto_push_interval: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     user : Mapped["User"] = relationship(back_populates="settings")
 

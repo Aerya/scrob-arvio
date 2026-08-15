@@ -1102,6 +1102,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 <div class="flex items-center gap-2">
                   {settings.bingebase_connected && (
                     <div class="flex gap-2" onclick="event.stopPropagation()">
+                      <button type="button" data-action="sync_bingebase" class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer" title="Sync / Pull history from Bingebase to Scrob">Pull history</button>
                       <button type="button" data-action="push_bingebase" class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer" title="Push all historical watched items to Bingebase">Push history</button>
                     </div>
                   )}
@@ -1161,6 +1162,21 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                   </div>
                   <div class="space-y-4">
                     <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                      <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Bingebase → Scrob</p>
+                      <label class="flex items-center gap-3 cursor-pointer group">
+                        <input type="checkbox" name="bingebase_sync_watched" id="bingebase_sync_watched" checked={settings.bingebase_sync_watched !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-emerald-500 cursor-pointer" />
+                        <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Watched status</span>
+                      </label>
+                      <button
+                        type="button"
+                        data-action="sync_bingebase"
+                        disabled={!settings.bingebase_connected}
+                        class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                        title="Pull / Sync watched items from Bingebase to Scrob"
+                      >Pull history</button>
+                    </div>
+
+                    <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
                       <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Scrob → Bingebase</p>
                       <label class="flex items-center gap-3 cursor-pointer group">
                         <input type="checkbox" name="bingebase_scrobble" id="bingebase_scrobble" checked={settings.bingebase_scrobble !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-emerald-500 cursor-pointer" />
@@ -1179,6 +1195,28 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                         class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
                         title="Push all historical watched items from Scrob to Bingebase"
                       >Push all history</button>
+                    </div>
+
+                    <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                      <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Auto Sync</p>
+                      <div class="flex items-center justify-between gap-4">
+                        <label for="bingebase_auto_sync_interval" class="text-sm text-zinc-300">Pull interval</label>
+                        <select name="bingebase_auto_sync_interval" id="bingebase_auto_sync_interval" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all cursor-pointer">
+                          <option value="" selected={!settings.bingebase_auto_sync_interval}>Disabled</option>
+                          {AUTO_SYNC_INTERVAL_OPTIONS.map(({ value, label }) => (
+                            <option value={String(value)} selected={settings.bingebase_auto_sync_interval === value}>{label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div class="flex items-center justify-between gap-4">
+                        <label for="bingebase_auto_push_interval" class="text-sm text-zinc-300">Push interval</label>
+                        <select name="bingebase_auto_push_interval" id="bingebase_auto_push_interval" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all cursor-pointer">
+                          <option value="" selected={!settings.bingebase_auto_push_interval}>Disabled</option>
+                          {AUTO_SYNC_INTERVAL_OPTIONS.map(({ value, label }) => (
+                            <option value={String(value)} selected={settings.bingebase_auto_push_interval === value}>{label}</option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -3000,11 +3038,15 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             showMessage('MDBList settings saved.');
             return;
           } else if (action === 'save_bingebase_settings') {
+            const autoSyncVal = (document.getElementById('bingebase_auto_sync_interval') as HTMLSelectElement)?.value;
+            const autoPushVal = (document.getElementById('bingebase_auto_push_interval') as HTMLSelectElement)?.value;
             const body: Record<string, any> = {
               bingebase_webhook_url: (document.getElementById('bingebase_webhook_url') as HTMLInputElement)?.value || null,
               bingebase_api_key: (document.getElementById('bingebase_api_key') as HTMLInputElement)?.value || null,
+              bingebase_auto_sync_interval: autoSyncVal ? parseFloat(autoSyncVal) : null,
+              bingebase_auto_push_interval: autoPushVal ? parseFloat(autoPushVal) : null,
             };
-            const bingebaseKeys = ['bingebase_scrobble', 'bingebase_push_watched', 'bingebase_push_ratings'];
+            const bingebaseKeys = ['bingebase_sync_watched', 'bingebase_scrobble', 'bingebase_push_watched', 'bingebase_push_ratings'];
             for (const key of bingebaseKeys) {
               const el = document.getElementById(key) as HTMLInputElement | null;
               if (el) body[key] = el.checked;
@@ -3019,6 +3061,19 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               throw new Error(err.detail || 'Failed to save Bingebase settings');
             }
             showMessage('Bingebase settings saved.');
+            return;
+          } else if (action === 'sync_bingebase') {
+            const res = await fetch('/api/proxy/bingebase/sync', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Failed to start Bingebase sync');
+            }
+            const data = await res.json();
+            showMessage('Bingebase sync started in the background.');
+            trackBingebaseJob(data.job_id);
             return;
           } else if (action === 'push_bingebase') {
             const pushRes = await fetch('/api/proxy/bingebase/push', {
