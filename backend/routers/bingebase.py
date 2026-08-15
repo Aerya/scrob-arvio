@@ -49,7 +49,7 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
             )
             await db.commit()
 
-            print(f"Bingebase push job {job_id}: queued {total_items} watched items.")
+            logger.info("Bingebase push job %s: queued %s watched items.", job_id, total_items)
 
             processed_so_far = 0
             for i, event in enumerate(events, 1):
@@ -64,7 +64,10 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
                     await db.commit()
                     await _raise_if_cancelled(db, job_id)
 
-                await asyncio.sleep(0.05)  # Slight delay to avoid overwhelming webhook server
+                if i % 100 == 0 or i == total_items:
+                    logger.info("Bingebase push job %s: %s/%s items pushed", job_id, i, total_items)
+
+                await asyncio.sleep(0.02)  # Slight delay to avoid overwhelming webhook server
 
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
@@ -74,7 +77,7 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
                 )
             )
             await db.commit()
-            print(f"Bingebase push job {job_id} completed: {processed_so_far} items pushed.")
+            logger.info("Bingebase push job %s completed: %s items pushed.", job_id, processed_so_far)
         except SyncCancelled:
             logger.info("Bingebase push job %s cancelled", job_id)
             await db.rollback()
