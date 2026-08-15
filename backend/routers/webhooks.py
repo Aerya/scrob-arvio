@@ -234,10 +234,11 @@ async def _maybe_bingebase_scrobble(
         event_name = "playback.stop" if action == "stop" else ("playback.pause" if action == "pause" else "playback.start")
 
         provider_ids = {}
+        imdb_id = getattr(media, "imdb_id", None) or (media.tmdb_data.get("imdb_id") if isinstance(getattr(media, "tmdb_data", None), dict) else None)
         if media.tmdb_id:
             provider_ids["Tmdb"] = str(media.tmdb_id)
-        if media.imdb_id:
-            provider_ids["Imdb"] = media.imdb_id
+        if imdb_id:
+            provider_ids["Imdb"] = str(imdb_id)
 
         item_data = {
             "Name": media.title,

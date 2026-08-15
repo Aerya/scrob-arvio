@@ -9,6 +9,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 
 from sqlalchemy.orm.exc import StaleDataError
 
+from models.base import MediaType
+from models.media import Media
 from routers import webhooks
 from routers.webhooks import (
     _commit_playback_session_update,
@@ -465,6 +467,19 @@ class TestBingebaseScrobble(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["Event"], "playback.stop")
             self.assertEqual(kwargs["json"]["Item"]["ProviderIds"]["Tmdb"], "550")
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret-token")
+
+    async def test_maybe_bingebase_scrobble_real_media_instance(self):
+        settings = SimpleNamespace(
+            bingebase_scrobble=True,
+            bingebase_webhook_url="https://bingebase.com/api/webhook",
+            bingebase_api_key=None,
+        )
+        media = Media(media_type=MediaType.movie, title="Test Movie", tmdb_id=1234, tmdb_data={"imdb_id": "tt1234567"})
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            await _maybe_bingebase_scrobble(settings, media, "stop", 0.9)
+            mock_post.assert_called_once()
+            _, kwargs = mock_post.call_args
+            self.assertEqual(kwargs["json"]["Item"]["ProviderIds"]["Imdb"], "tt1234567")
 
 
 if __name__ == "__main__":
