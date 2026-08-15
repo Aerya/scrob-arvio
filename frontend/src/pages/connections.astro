@@ -1102,7 +1102,6 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 <div class="flex items-center gap-2">
                   {settings.bingebase_connected && (
                     <div class="flex gap-2" onclick="event.stopPropagation()">
-                      <button type="button" data-action="sync_bingebase" class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer" title="Sync / Pull history from Bingebase to Scrob">Pull history</button>
                       <button type="button" data-action="push_bingebase" class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer" title="Push all historical watched items to Bingebase">Push history</button>
                     </div>
                   )}
@@ -1161,19 +1160,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                     </div>
                   </div>
                   <div class="space-y-4">
-                    <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
-                      <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Bingebase → Scrob</p>
-                      <label class="flex items-center gap-3 cursor-pointer group">
-                        <input type="checkbox" name="bingebase_sync_watched" id="bingebase_sync_watched" checked={settings.bingebase_sync_watched !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-emerald-500 cursor-pointer" />
-                        <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Watched status</span>
-                      </label>
-                      <button
-                        type="button"
-                        data-action="sync_bingebase"
-                        disabled={!settings.bingebase_connected}
-                        class="js-action-btn text-sm bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
-                        title="Pull / Sync watched items from Bingebase to Scrob"
-                      >Pull history</button>
+                    <div class="bg-zinc-950 rounded-xl p-4 space-y-2">
+                      <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Bingebase Webhook</p>
+                      <p class="text-xs text-zinc-400">Bingebase is a push-only webhook target. Scrob forwards watch events and historical data directly to your Bingebase Webhook URL.</p>
                     </div>
 
                     <div class="bg-zinc-950 rounded-xl p-4 space-y-3">

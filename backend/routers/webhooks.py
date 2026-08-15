@@ -223,12 +223,12 @@ async def _maybe_bingebase_scrobble(
     db: AsyncSession | None = None,
     client: Any | None = None,
     is_push: bool = False,
-) -> None:
-    """Forward a play/pause/stop event to Bingebase Webhook URL. Errors are swallowed."""
+) -> bool:
+    """Forward a play/pause/stop event to Bingebase Webhook URL. Returns True if successfully sent."""
     if not (settings and settings.bingebase_webhook_url):
-        return
+        return False
     if not is_push and not settings.bingebase_scrobble:
-        return
+        return False
 
     try:
         import httpx
@@ -283,13 +283,20 @@ async def _maybe_bingebase_scrobble(
             resp = await http_client.post(settings.bingebase_webhook_url, json=payload, headers=headers)
             status_code = getattr(resp, "status_code", 200)
             if isinstance(status_code, int) and status_code >= 400:
-                logging.getLogger(__name__).warning("[Bingebase scrobble] HTTP %s from webhook: %s", status_code, str(getattr(resp, "text", ""))[:200])
+                logging.getLogger(__name__).error(
+                    "[Bingebase scrobble] HTTP %s from webhook: %s",
+                    status_code,
+                    str(getattr(resp, "text", ""))[:200],
+                )
+                return False
+            return True
         finally:
             if should_close:
                 await http_client.aclose()
     except Exception as exc:
         import logging
-        logging.getLogger(__name__).warning("[Bingebase scrobble] %s failed: %s", action, exc)
+        logging.getLogger(__name__).error("[Bingebase scrobble] %s failed: %s", action, exc)
+        return False
 
 
 async def _get_tmdb_key(db: AsyncSession, settings: UserSettings | None) -> str | None:
