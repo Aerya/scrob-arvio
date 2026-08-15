@@ -449,8 +449,24 @@ async def _watchlist_poller():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Ensure all Bingebase columns exist on existing databases
+        for col_def in [
+            "bingebase_webhook_url VARCHAR(500)",
+            "bingebase_api_key VARCHAR(255)",
+            "bingebase_sync_watched BOOLEAN DEFAULT TRUE",
+            "bingebase_scrobble BOOLEAN DEFAULT TRUE",
+            "bingebase_push_watched BOOLEAN DEFAULT FALSE",
+            "bingebase_push_ratings BOOLEAN DEFAULT FALSE",
+            "bingebase_auto_sync_interval FLOAT",
+            "bingebase_auto_push_interval FLOAT",
+        ]:
+            try:
+                await conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS {col_def}"))
+            except Exception:
+                pass
 
     # Clean up stuck sync jobs and orphaned playback sessions on startup
     from db import async_sessionmaker

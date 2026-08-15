@@ -18,16 +18,22 @@ depends_on = None
 def upgrade() -> None:
     with op.get_context().autocommit_block():
         op.execute("ALTER TYPE collectionsource ADD VALUE IF NOT EXISTS 'bingebase'")
-    op.add_column("user_settings", sa.Column("bingebase_webhook_url", sa.String(500), nullable=True))
-    op.add_column("user_settings", sa.Column("bingebase_api_key", sa.String(255), nullable=True))
-    op.add_column("user_settings", sa.Column("bingebase_scrobble", sa.Boolean(), server_default="true", nullable=False))
-    op.add_column("user_settings", sa.Column("bingebase_push_watched", sa.Boolean(), server_default="false", nullable=False))
-    op.add_column("user_settings", sa.Column("bingebase_push_ratings", sa.Boolean(), server_default="false", nullable=False))
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_webhook_url VARCHAR(500)")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_api_key VARCHAR(255)")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_sync_watched BOOLEAN DEFAULT TRUE NOT NULL")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_scrobble BOOLEAN DEFAULT TRUE NOT NULL")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_push_watched BOOLEAN DEFAULT FALSE NOT NULL")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_push_ratings BOOLEAN DEFAULT FALSE NOT NULL")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_auto_sync_interval FLOAT")
+    op.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bingebase_auto_push_interval FLOAT")
 
 
 def downgrade() -> None:
-    op.drop_column("user_settings", "bingebase_push_ratings")
-    op.drop_column("user_settings", "bingebase_push_watched")
-    op.drop_column("user_settings", "bingebase_scrobble")
-    op.drop_column("user_settings", "bingebase_api_key")
-    op.drop_column("user_settings", "bingebase_webhook_url")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_auto_push_interval")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_auto_sync_interval")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_push_ratings")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_push_watched")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_scrobble")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_sync_watched")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_api_key")
+    op.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS bingebase_webhook_url")
