@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  workflow_dispatch:
-
 jobs:
   build-docker-x64:
     name: Build & Push Docker Image (amd64)
