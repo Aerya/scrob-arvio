@@ -1,5 +1,9 @@
 # ── Stage 1: Build frontend ───────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22.23.4-alpine AS frontend-builder
+
+# eMudhra: refresh both the CA sources and the generated bundle.
+RUN apk add --no-cache --upgrade ca-certificates ca-certificates-bundle \
+    && update-ca-certificates
 WORKDIR /app/frontend
 
 COPY frontend/package*.json ./
@@ -10,6 +14,12 @@ RUN npm run build
 
 # ── Stage 2: Runtime (Python + Node + supervisord) ────────────────────────────
 FROM python:3.12-slim
+
+# eMudhra: refresh the OS trust store for this security update.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
@@ -23,6 +33,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     tzdata \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
+    && dpkg --compare-versions "$(node --version | cut -c2-)" ge 22.23.4 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

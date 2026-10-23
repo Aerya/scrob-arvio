@@ -15,6 +15,12 @@
 
 Scrob syncs your libraries from **Jellyfin**, **Plex**, **Emby**, **Nuvio**, **ARVIO**, and **Stremio**, tracks your watch history, ratings, and personal lists, and can push watched activity back to connected providers - all from a clean, app-like web interface that installs as a PWA on any device.
 
+### TLS security — October 2026
+
+Update image trust stores and TLS components following the eMudhra incident. Checks cover the compromised chains, including both No CT cases, and a valid HTTPS connection. Running images remain unchanged: schedule their replacement after validation.
+
+[Incident details](https://emudhra.we-have-a-problem.com/) · [TLS checks](security/emudhra/README.md)
+
 ## Table of Contents
 
 - [Features](#features)
