@@ -20,3 +20,8 @@ certificats publics. Aucun secret ni donnée de déploiement n’est utilisé.
 Cette validation couvre les magasins et clients indiqués dans le workflow,
 pas tous les navigateurs, plugins, binaires tiers ou parcours métier possibles.
 Les tests applicatifs habituels restent nécessaires avant fusion.
+
+Publication GHCR : les noms d’images des workflows de release et de branche
+sont normalisés en minuscules. Sans cette normalisation, le préfixe `Aerya`
+fait échouer la publication multiarchitecture avant même la construction.
+Le workflow x64 utilisant docker/metadata-action normalisait déjà les noms.

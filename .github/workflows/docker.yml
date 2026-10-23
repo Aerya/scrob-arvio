@@ -15,6 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Normaliser le nom de l’image GHCR
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -41,7 +46,7 @@ jobs:
           build-args: |
             APP_VERSION=${{ steps.branch.outputs.tag }}-dev
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.branch.outputs.tag }}
+            ${{ steps.image.outputs.name }}:${{ steps.branch.outputs.tag }}
           cache-from: type=gha,scope=scrob-${{ steps.branch.outputs.tag }}
           cache-to: type=gha,mode=max,scope=scrob-${{ steps.branch.outputs.tag }}
 
@@ -55,6 +60,6 @@ jobs:
           build-args: |
             APP_VERSION=${{ steps.branch.outputs.tag }}-dev
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.branch.outputs.tag }}-omnibus
+            ${{ steps.image.outputs.name }}:${{ steps.branch.outputs.tag }}-omnibus
           cache-from: type=gha,scope=scrob-omnibus-${{ steps.branch.outputs.tag }}
           cache-to: type=gha,mode=max,scope=scrob-omnibus-${{ steps.branch.outputs.tag }}

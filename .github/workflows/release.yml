@@ -45,6 +45,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Normaliser le nom de l’image GHCR
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -67,9 +72,9 @@ jobs:
           build-args: |
             APP_VERSION=${{ needs.release.outputs.new_release_version }}
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:main
-            ghcr.io/${{ github.repository }}:${{ needs.release.outputs.new_release_version }}
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:main
+            ${{ steps.image.outputs.name }}:${{ needs.release.outputs.new_release_version }}
           cache-from: type=gha,scope=scrob-release
           cache-to: type=gha,mode=max,scope=scrob-release
 
@@ -83,8 +88,8 @@ jobs:
           build-args: |
             APP_VERSION=${{ needs.release.outputs.new_release_version }}
           tags: |
-            ghcr.io/${{ github.repository }}:latest-omnibus
-            ghcr.io/${{ github.repository }}:main-omnibus
-            ghcr.io/${{ github.repository }}:${{ needs.release.outputs.new_release_version }}-omnibus
+            ${{ steps.image.outputs.name }}:latest-omnibus
+            ${{ steps.image.outputs.name }}:main-omnibus
+            ${{ steps.image.outputs.name }}:${{ needs.release.outputs.new_release_version }}-omnibus
           cache-from: type=gha,scope=scrob-omnibus-release
           cache-to: type=gha,mode=max,scope=scrob-omnibus-release
