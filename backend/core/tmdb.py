@@ -1,15 +1,69 @@
 import asyncio
+import contextlib
 import time
 import httpx
 from core.config import settings
 
 TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_BASE_V4 = "https://api.themoviedb.org/4"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 
 # Errors that are worth retrying (transient). 404/4xx are permanent — don't retry.
-_RETRYABLE = (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)
+# ReadError/WriteError cover a kept-alive connection that went stale (reset by
+# TMDB's edge or a NAT/proxy in between): the retry opens a fresh one.
+_RETRYABLE = (
+    httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError,
+    httpx.ReadError, httpx.WriteError,
+)
 
 DEFAULT_CACHE_TTL = 1800  # 30 minutes — TMDB metadata/discovery results don't need to be fresher than this
+
+# Crew jobs surfaced in a title's "Crew" tab - a curated allowlist, not a
+# department filter: TMDB's "Production" department alone pulls in Casting,
+# Production Coordinator, Assistant Director tiers, etc., which is far more
+# than a viewer means by "who directed/wrote/produced this".
+NOTABLE_CREW_JOBS = {"Director", "Writer", "Screenplay", "Story", "Teleplay", "Producer", "Executive Producer", "Co-Producer"}
+
+# Request-path budget. Kept deliberately tight: these calls sit inside
+# page-render fan-outs (home page enrich_with_state, Next Up, etc.), so a wide
+# retry window turns "TMDB is unreachable" into a multi-minute hang and a proxy
+# 504 instead of a quick fall-back to locally-stored data. The circuit breaker
+# below then makes every call after the first failure return instantly.
+_HTTP_TIMEOUT = 8.0
+_MAX_RETRIES = 1
+_BACKOFF_BASE = 1  # seconds; sleep is _BACKOFF_BASE * 2**attempt between tries
+
+# Circuit breaker: after _BREAKER_THRESHOLD consecutive retryable failures,
+# short-circuit every _get for _BREAKER_COOLDOWN seconds. _fail_count is not
+# reset when the cooldown lapses, so the first probe request that fails again
+# re-opens the breaker immediately; a single success resets everything.
+_BREAKER_THRESHOLD = 3
+_BREAKER_COOLDOWN = 45.0
+_breaker_fail_count = 0
+_breaker_open_until = 0.0
+
+
+class TMDBUnavailable(Exception):
+    """Raised by _get while the circuit breaker is open (TMDB looks down).
+    Callers that already tolerate a missing TMDB response - the metadata
+    enrichers, trending rows, etc. - catch this like any other fetch error."""
+
+
+def _breaker_blocked() -> bool:
+    return _breaker_open_until > time.monotonic()
+
+
+def _breaker_record_success() -> None:
+    global _breaker_fail_count, _breaker_open_until
+    _breaker_fail_count = 0
+    _breaker_open_until = 0.0
+
+
+def _breaker_record_failure() -> None:
+    global _breaker_fail_count, _breaker_open_until
+    _breaker_fail_count += 1
+    if _breaker_fail_count >= _BREAKER_THRESHOLD:
+        _breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN
 
 
 class _TTLCache:
@@ -41,6 +95,29 @@ class _TTLCache:
 
 _cache = _TTLCache()
 
+# One pooled client for the whole process, opened and closed by main.lifespan:
+# a client per call rebuilt its TLS context (blocking the event loop) and paid
+# DNS + TCP + TLS on every request. keepalive_expiry must stay below TMDB's
+# edge idle timeout (~3 min). No connection cap, as before: a pool wait would
+# count against _HTTP_TIMEOUT and could trip the breaker.
+_client: httpx.AsyncClient | None = None
+
+
+def init_client() -> None:
+    global _client
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(_HTTP_TIMEOUT),
+        limits=httpx.Limits(max_connections=None, keepalive_expiry=120.0),
+    )
+
+
+async def close_client() -> None:
+    global _client
+    # Cleared first: a call racing shutdown falls back instead of using a closed client.
+    client, _client = _client, None
+    if client is not None:
+        await client.aclose()
+
 
 def get_headers(api_key: str = None) -> dict:
     key = api_key or getattr(settings, 'tmdb_api_key', None)
@@ -57,7 +134,7 @@ async def _get(
     *,
     headers: dict = None,
     params: dict = None,
-    max_retries: int = 3,
+    max_retries: int = _MAX_RETRIES,
     cache_ttl: float | None = DEFAULT_CACHE_TTL,
 ) -> dict:
     """Shared GET helper with retry + exponential backoff for transient failures.
@@ -67,6 +144,9 @@ async def _get(
     so it's deliberately excluded from the cache key to share hits across users/
     jobs. Pass cache_ttl=None to bypass caching (e.g. validate_api_key, where the
     response genuinely depends on which key was used).
+
+    Raises TMDBUnavailable immediately (no HTTP attempt) while the circuit
+    breaker is open — see the _breaker_* helpers above.
     """
     cache_key = None
     if cache_ttl is not None:
@@ -75,26 +155,39 @@ async def _get(
         if cached is not None:
             return cached
 
-    last_exc: Exception = None
+    if _breaker_blocked():
+        raise TMDBUnavailable("TMDB circuit breaker open")
+
+    last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            # No shared client outside the app lifespan (unit tests, scripts).
+            async with (contextlib.nullcontext(_client) if _client is not None
+                        else httpx.AsyncClient(timeout=httpx.Timeout(_HTTP_TIMEOUT))) as client:
                 r = await client.get(url, headers=headers or {}, params=params)
                 if r.status_code == 429:
                     wait = int(r.headers.get("Retry-After", 2 ** (attempt + 1)))
+                    last_exc = httpx.HTTPStatusError(
+                        "429 Too Many Requests", request=r.request, response=r
+                    )
                     await asyncio.sleep(wait)
                     continue
                 r.raise_for_status()
                 data = r.json()
                 if cache_key is not None:
                     _cache.set(cache_key, data, cache_ttl)
+                _breaker_record_success()
                 return data
         except _RETRYABLE as e:
             last_exc = e
             if attempt < max_retries:
-                await asyncio.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
+                await asyncio.sleep(_BACKOFF_BASE * 2 ** attempt)  # 1s, 2s, ...
         except httpx.HTTPStatusError:
             raise  # 4xx/5xx — don't retry, surface immediately
+    # Only a genuine connectivity/timeout failure trips the breaker; a 429 just
+    # means TMDB is up and throttling us.
+    if isinstance(last_exc, _RETRYABLE):
+        _breaker_record_failure()
     raise last_exc
 
 
@@ -108,18 +201,27 @@ async def validate_api_key(api_key: str) -> bool:
         return False
 
 
-async def get_movie(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
-    params: dict = {"append_to_response": "credits,release_dates,recommendations,external_ids"}
+async def get_movie(tmdb_id: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
+    params: dict = {"append_to_response": "credits,release_dates,recommendations,external_ids,keywords"}
     if language:
         params["language"] = language
     return await _get(
         f"{TMDB_BASE}/movie/{tmdb_id}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_show(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
+def extract_credits_stingers(data: dict) -> tuple[bool, bool]:
+    """Returns (has_mid_credits_scene, has_post_credits_scene) from a movie
+    response's appended keywords (#319) - TMDB tags these via community-added
+    keywords rather than a dedicated field, and only does so for movies."""
+    names = {k.get("name", "") for k in (data.get("keywords") or {}).get("keywords", [])}
+    return "duringcreditsstinger" in names, "aftercreditsstinger" in names
+
+
+async def get_show(tmdb_id: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {"append_to_response": "credits,content_ratings,recommendations,external_ids"}
     if language:
         params["language"] = language
@@ -127,10 +229,11 @@ async def get_show(tmdb_id: int, api_key: str = None, language: str | None = Non
         f"{TMDB_BASE}/tv/{tmdb_id}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_season(tmdb_id: int, season_number: int, api_key: str = None, language: str | None = None) -> dict:
+async def get_season(tmdb_id: int, season_number: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {}
     if language:
         params["language"] = language
@@ -138,17 +241,21 @@ async def get_season(tmdb_id: int, season_number: int, api_key: str = None, lang
         f"{TMDB_BASE}/tv/{tmdb_id}/season/{season_number}",
         headers=get_headers(api_key),
         params=params or None,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_episode(tmdb_id: int, season_number: int, episode_number: int, api_key: str = None, language: str | None = None) -> dict:
-    params: dict = {"append_to_response": "credits"}
+async def get_episode(tmdb_id: int, season_number: int, episode_number: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
+    # external_ids rides along so enrichment can persist the TVDB episode id
+    # (and IMDb id) on the Media row without a second per-episode call.
+    params: dict = {"append_to_response": "credits,external_ids"}
     if language:
         params["language"] = language
     return await _get(
         f"{TMDB_BASE}/tv/{tmdb_id}/season/{season_number}/episode/{episode_number}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
@@ -164,12 +271,57 @@ async def get_episode_external_ids(
     )
 
 
-async def get_trending_movies(time_window: str = "day", page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/trending/movie/{time_window}", headers=get_headers(api_key), params={"page": page})
+# TMDB episode-group type ids -> a human label (see #174). 1 is the show's
+# regular aired order and is offered separately, so it's excluded by callers.
+EPISODE_GROUP_TYPE_LABELS = {
+    1: "Original Air Date",
+    2: "Absolute Order",
+    3: "DVD Order",
+    4: "Digital Order",
+    5: "Story Arc",
+    6: "Production Order",
+    7: "TV Order",
+}
 
 
-async def get_trending_shows(time_window: str = "day", page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/trending/tv/{time_window}", headers=get_headers(api_key), params={"page": page})
+async def get_episode_groups(
+    tmdb_id: int, api_key: str = None, cache_ttl: float | None = DEFAULT_CACHE_TTL
+) -> dict:
+    """`GET /tv/{id}/episode_groups` - the alternate orderings TMDB has for a
+    show. Returns `{"results": [{id, name, type, episode_count, group_count, ...}]}`."""
+    return await _get(
+        f"{TMDB_BASE}/tv/{tmdb_id}/episode_groups",
+        headers=get_headers(api_key),
+        cache_ttl=cache_ttl,
+    )
+
+
+async def get_episode_group(
+    group_id: str, api_key: str = None, cache_ttl: float | None = DEFAULT_CACHE_TTL
+) -> dict:
+    """`GET /tv/episode_group/{id}` - one ordering's full structure:
+    `{id, name, type, groups: [{order, name, episodes: [{id, season_number,
+    episode_number, order, ...}]}]}`. Each episode's season_number/episode_number
+    are the canonical TMDB values; `order` is its 0-based slot in the group."""
+    return await _get(
+        f"{TMDB_BASE}/tv/episode_group/{group_id}",
+        headers=get_headers(api_key),
+        cache_ttl=cache_ttl,
+    )
+
+
+async def get_trending_movies(time_window: str = "day", page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/trending/movie/{time_window}", headers=get_headers(api_key), params=params)
+
+
+async def get_trending_shows(time_window: str = "day", page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/trending/tv/{time_window}", headers=get_headers(api_key), params=params)
 
 
 async def get_show_light(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
@@ -192,20 +344,32 @@ async def get_on_air_today(page: int = 1, api_key: str = None, timezone: str = "
     return await _get(f"{TMDB_BASE}/tv/airing_today", headers=get_headers(api_key), params={"page": page, "timezone": timezone})
 
 
-async def get_popular_movies(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/movie/popular", headers=get_headers(api_key), params={"page": page})
+async def get_popular_movies(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/movie/popular", headers=get_headers(api_key), params=params)
 
 
-async def get_top_rated_movies(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/movie/top_rated", headers=get_headers(api_key), params={"page": page})
+async def get_top_rated_movies(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/movie/top_rated", headers=get_headers(api_key), params=params)
 
 
-async def get_popular_shows(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/tv/popular", headers=get_headers(api_key), params={"page": page})
+async def get_popular_shows(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/tv/popular", headers=get_headers(api_key), params=params)
 
 
-async def get_top_rated_shows(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/tv/top_rated", headers=get_headers(api_key), params={"page": page})
+async def get_top_rated_shows(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/tv/top_rated", headers=get_headers(api_key), params=params)
 
 
 async def search_multi(q: str, page: int = 1, api_key: str = None, language: str | None = None) -> dict:
@@ -241,10 +405,52 @@ async def search_people(q: str, page: int = 1, api_key: str = None) -> dict:
     return await _get(f"{TMDB_BASE}/search/person", headers=get_headers(api_key), params={"query": q, "include_adult": "false", "page": page})
 
 
+async def search_company(q: str, page: int = 1, api_key: str = None) -> dict:
+    """Search production companies / studios by name. TMDB has no equivalent
+    network-search endpoint (see core/networks.py for how networks are found)."""
+    return await _get(f"{TMDB_BASE}/search/company", headers=get_headers(api_key), params={"query": q, "page": page})
+
+
 def poster_url(path: str, size: str = "w500") -> str | None:
     if not path:
         return None
     return f"{TMDB_IMAGE_BASE}/{size}{path}"
+
+
+def notable_crew(credits: dict, limit: int = 12, profile_size: str = "w500") -> list[dict]:
+    """Director/writer/producer crew for a title's "Crew" tab, deduped by
+    person id - a writer-director (e.g. Richard Kelly on Donnie Darko) is one
+    entry with a combined job label, not two rows for the same person."""
+    by_id: dict[int, dict] = {}
+    order: list[int] = []
+    for c in credits.get("crew", []):
+        job = c.get("job")
+        if job not in NOTABLE_CREW_JOBS:
+            continue
+        pid = c.get("id")
+        if pid is None:
+            continue
+        if pid not in by_id:
+            by_id[pid] = {
+                "tmdb_id": pid,
+                "name": c.get("name"),
+                "jobs": [job],
+                "profile_path": poster_url(c.get("profile_path"), size=profile_size),
+            }
+            order.append(pid)
+        elif job not in by_id[pid]["jobs"]:
+            by_id[pid]["jobs"].append(job)
+
+    result = []
+    for pid in order[:limit]:
+        entry = by_id[pid]
+        result.append({
+            "tmdb_id": entry["tmdb_id"],
+            "name": entry["name"],
+            "job": ", ".join(entry["jobs"]),
+            "profile_path": entry["profile_path"],
+        })
+    return result
 
 
 async def get_person(person_id: int, api_key: str = None) -> dict:
@@ -282,6 +488,8 @@ async def get_show_recommendations(show_id: int, api_key: str = None) -> dict:
 async def discover_movies(
     page: int = 1,
     genre_id: int | None = None,
+    genre_ids: list[int] | None = None,  # OR'd via TMDB's "|" syntax; takes priority over genre_id if both given
+    without_genre_ids: list[int] | None = None,  # genres to leave out; any match excludes ("|" = OR)
     year: int | None = None,
     min_rating: float | None = None,
     vote_count_min: int | None = None,
@@ -290,7 +498,9 @@ async def discover_movies(
     watch_provider_id: int | None = None,
     watch_region: str = "US",
     with_original_language: str | None = None,
+    with_companies: int | None = None,
     api_key: str = None,
+    language: str | None = None,
 ) -> dict:
     params: dict = {
         "page": page,
@@ -298,8 +508,12 @@ async def discover_movies(
         "include_adult": "false",
         "vote_count.gte": vote_count_min if vote_count_min is not None else 50,
     }
-    if genre_id:
+    if genre_ids:
+        params["with_genres"] = "|".join(str(g) for g in genre_ids)
+    elif genre_id:
         params["with_genres"] = genre_id
+    if without_genre_ids:
+        params["without_genres"] = "|".join(str(g) for g in without_genre_ids)
     if year:
         params["primary_release_year"] = year
     if min_rating:
@@ -311,12 +525,18 @@ async def discover_movies(
         params["watch_region"] = watch_region
     if with_original_language:
         params["with_original_language"] = with_original_language
+    if with_companies is not None:
+        params["with_companies"] = with_companies
+    if language:
+        params["language"] = language
     return await _get(f"{TMDB_BASE}/discover/movie", headers=get_headers(api_key), params=params)
 
 
 async def discover_shows(
     page: int = 1,
     genre_id: int | None = None,
+    genre_ids: list[int] | None = None,  # OR'd via TMDB's "|" syntax; takes priority over genre_id if both given
+    without_genre_ids: list[int] | None = None,  # genres to leave out; any match excludes ("|" = OR)
     year: int | None = None,
     min_rating: float | None = None,
     vote_count_min: int | None = None,
@@ -326,7 +546,10 @@ async def discover_shows(
     watch_provider_id: int | None = None,
     watch_region: str = "US",
     with_original_language: str | None = None,
+    with_networks: int | None = None,
+    with_companies: int | None = None,
     api_key: str = None,
+    language: str | None = None,
 ) -> dict:
     params: dict = {
         "page": page,
@@ -334,8 +557,12 @@ async def discover_shows(
         "include_adult": "false",
         "vote_count.gte": vote_count_min if vote_count_min is not None else 50,
     }
-    if genre_id:
+    if genre_ids:
+        params["with_genres"] = "|".join(str(g) for g in genre_ids)
+    elif genre_id:
         params["with_genres"] = genre_id
+    if without_genre_ids:
+        params["without_genres"] = "|".join(str(g) for g in without_genre_ids)
     if year:
         params["first_air_date_year"] = year
     if min_rating:
@@ -349,6 +576,12 @@ async def discover_shows(
         params["watch_region"] = watch_region
     if with_original_language:
         params["with_original_language"] = with_original_language
+    if with_networks is not None:
+        params["with_networks"] = with_networks
+    if with_companies is not None:
+        params["with_companies"] = with_companies
+    if language:
+        params["language"] = language
     return await _get(f"{TMDB_BASE}/discover/tv", headers=get_headers(api_key), params=params)
 
 
@@ -356,8 +589,52 @@ async def get_collection(collection_id: int, api_key: str = None) -> dict:
     return await _get(f"{TMDB_BASE}/collection/{collection_id}", headers=get_headers(api_key))
 
 
+async def get_list(list_id: int, api_key: str = None, page: int = 1) -> dict:
+    """TMDB v4 "List" details - GET /4/list/{list_id} (#442). Unlike v3's
+    single-page, movie-only /3/list/{list_id}, v4 supports mixed movie/tv
+    lists (each result item carries media_type) and paginates at 20 items
+    per page - the response's total_pages tells the caller whether to loop.
+
+    v4 also transparently serves legacy v3-created lists (verified against
+    a real v3 list, id 1, via both endpoints) - the id space is shared, so
+    this one function covers every TMDB list a user might paste a link to.
+    Requires the same v4 read-access-token this app already stores as its
+    "TMDB API key" (get_headers's Bearer auth already is v4-style)."""
+    return await _get(f"{TMDB_BASE_V4}/list/{list_id}", headers=get_headers(api_key), params={"page": page})
+
+
+async def get_network(network_id: int, api_key: str = None) -> dict:
+    """TV network details (name, logo_path, origin_country, homepage)."""
+    return await _get(f"{TMDB_BASE}/network/{network_id}", headers=get_headers(api_key))
+
+
+async def get_company(company_id: int, api_key: str = None) -> dict:
+    """Production company details (name, logo_path, origin_country, homepage)."""
+    return await _get(f"{TMDB_BASE}/company/{company_id}", headers=get_headers(api_key))
+
+
 async def get_movie_videos(tmdb_id: int, api_key: str = None) -> dict:
     return await _get(f"{TMDB_BASE}/movie/{tmdb_id}/videos", headers=get_headers(api_key))
+
+
+async def get_videos(kind: str, tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
+    """Videos for a movie ("movie") or show ("tv"). With `language`, TMDB returns
+    only videos tagged with that language - no English fallback."""
+    params = {"language": language} if language else None
+    return await _get(f"{TMDB_BASE}/{kind}/{tmdb_id}/videos", headers=get_headers(api_key), params=params)
+
+
+def pick_trailer(videos: list[dict], language: str | None = None) -> dict | None:
+    """Best YouTube trailer: official first, then any. With `language` (e.g.
+    "pt-BR"), only videos tagged with that language qualify, so a localized
+    request never quietly returns the English trailer (#413)."""
+    lang = language.split("-")[0].lower() if language else None
+    trailers = [
+        v for v in videos
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("key")
+        and (not lang or (v.get("iso_639_1") or "").lower() == lang)
+    ]
+    return next((v for v in trailers if v.get("official")), trailers[0] if trailers else None)
 
 
 async def find_by_external_id(external_id: str, source: str, api_key: str = None) -> dict:

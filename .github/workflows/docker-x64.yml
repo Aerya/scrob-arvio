@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 jobs:
   build-docker-x64:
     name: Build & Push Docker Image (amd64)
@@ -15,6 +16,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Version du fork
+        run: echo "APP_VERSION=$(cat UPSTREAM_VERSION)-arvio.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Verify ARVIO public APP_ANON_KEY validity
         run: |
@@ -55,6 +59,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-args: APP_VERSION=${{ env.APP_VERSION }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -80,6 +85,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.omnibus
+          build-args: APP_VERSION=${{ env.APP_VERSION }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-omnibus.outputs.tags }}

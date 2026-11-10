@@ -118,7 +118,22 @@ class IntegrationCredentialRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
-        validate_api_key.assert_awaited_once_with("tvdb-secret")
+        validate_api_key.assert_awaited_once_with("tvdb-secret", pin=None)
+
+    async def test_tvdb_forwards_subscriber_pin_from_body(self) -> None:
+        app = _test_app()
+        transport = httpx.ASGITransport(app=app)
+        validate_api_key = AsyncMock(return_value=True)
+
+        with patch("core.tvdb.validate_api_key", validate_api_key):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/auth/test-tvdb",
+                    json={"key": "tvdb-secret", "pin": "sub-pin"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        validate_api_key.assert_awaited_once_with("tvdb-secret", pin="sub-pin")
 
     async def test_jellyfin_passes_body_credentials_including_user_id(self) -> None:
         app = _test_app()
@@ -327,6 +342,279 @@ class IntegrationCredentialRequestTests(unittest.IsolatedAsyncioTestCase):
             "https://radarr.example",
             "radarr-secret",
         )
+
+
+class _SettingsFakeDB:
+    """Queues results for db.execute() in call order: the UserSettings lookup,
+    then _settings_response's GlobalSettings lookup."""
+
+    def __init__(self, settings):
+        self._results = [settings, None]
+        self.commit = AsyncMock()
+        self.refresh = AsyncMock()
+
+    async def execute(self, stmt):
+        item = self._results.pop(0) if self._results else None
+        return SimpleNamespace(scalar_one_or_none=lambda: item)
+
+    def add(self, obj):
+        pass
+
+
+class UpdateUserSettingsBingebaseWebhookUrlValidationTests(unittest.IsolatedAsyncioTestCase):
+    """Regression test: bingebase_webhook_url is posted to on every playback
+    event with no validation at all, unlike every other user-supplied service
+    URL (Radarr/Sonarr/Jellyfin/etc.), which all go through validate_service_url
+    to block SSRF targets (cloud metadata endpoints, etc.). It needs the same
+    treatment - added to update_user_settings' url_fields map alongside
+    radarr_url/sonarr_url."""
+
+    async def test_bingebase_webhook_url_is_validated_like_radarr_and_sonarr(self) -> None:
+        from models.users import UserSettings
+
+        settings = UserSettings(user_id=1)
+        db = _SettingsFakeDB(settings)
+        validate_url = AsyncMock(return_value="https://bingebase.example/webhook")
+
+        with patch.object(auth, "validate_service_url", validate_url):
+            await auth.update_user_settings(
+                schemas.UserSettings(bingebase_webhook_url="https://bingebase.example/webhook/"),
+                db=db,
+                current_user=SimpleNamespace(id=1),
+            )
+
+        validate_url.assert_awaited_once_with(
+            "https://bingebase.example/webhook/", "Bingebase Webhook URL",
+        )
+        self.assertEqual(settings.bingebase_webhook_url, "https://bingebase.example/webhook")
+
+    async def test_ssrf_target_is_rejected(self) -> None:
+        from fastapi import HTTPException
+
+        from models.users import UserSettings
+        from core.url_validator import validate_service_url
+
+        settings = UserSettings(user_id=1)
+        db = _SettingsFakeDB(settings)
+
+        with patch.object(auth, "validate_service_url", validate_service_url):
+            with self.assertRaises(HTTPException) as ctx:
+                await auth.update_user_settings(
+                    schemas.UserSettings(bingebase_webhook_url="http://169.254.169.254/latest/meta-data/"),
+                    db=db,
+                    current_user=SimpleNamespace(id=1),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
+class UpdateUserSettingsTvdbPinValidationTests(unittest.IsolatedAsyncioTestCase):
+    """#322/#325: saving a TVDB key validates it together with the subscriber
+    PIN, and clearing the key skips validation entirely."""
+
+    async def test_key_and_pin_are_validated_together(self) -> None:
+        from models.users import UserSettings
+
+        settings = UserSettings(user_id=1)
+        db = _SettingsFakeDB(settings)
+        validate = AsyncMock(return_value=True)
+
+        with patch("core.tvdb.validate_api_key", validate):
+            await auth.update_user_settings(
+                schemas.UserSettings(tvdb_api_key="tvdb-key", tvdb_subscriber_pin="sub-pin"),
+                db=db,
+                current_user=SimpleNamespace(id=1),
+            )
+
+        validate.assert_awaited_once_with("tvdb-key", pin="sub-pin")
+        self.assertEqual(settings.tvdb_api_key, "tvdb-key")
+        self.assertEqual(settings.tvdb_subscriber_pin, "sub-pin")
+
+    async def test_rejected_pair_raises_400(self) -> None:
+        from fastapi import HTTPException
+        from models.users import UserSettings
+
+        settings = UserSettings(user_id=1)
+        db = _SettingsFakeDB(settings)
+
+        with patch("core.tvdb.validate_api_key", AsyncMock(return_value=False)):
+            with self.assertRaises(HTTPException) as ctx:
+                await auth.update_user_settings(
+                    schemas.UserSettings(tvdb_api_key="tvdb-key", tvdb_subscriber_pin="bad-pin"),
+                    db=db,
+                    current_user=SimpleNamespace(id=1),
+                )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_clearing_the_key_does_not_validate(self) -> None:
+        from models.users import UserSettings
+
+        settings = UserSettings(user_id=1, tvdb_api_key="old-sub-key", tvdb_subscriber_pin="old-pin")
+        db = _SettingsFakeDB(settings)
+        validate = AsyncMock(return_value=False)  # would block the clear if called
+
+        with patch("core.tvdb.validate_api_key", validate):
+            await auth.update_user_settings(
+                schemas.UserSettings(tvdb_api_key=None, tvdb_subscriber_pin=None),
+                db=db,
+                current_user=SimpleNamespace(id=1),
+            )
+
+        validate.assert_not_awaited()
+        self.assertIsNone(settings.tvdb_api_key)
+
+
+class _GlobalSettingsFakeDB:
+    """Queues a single result for _settings_response's own GlobalSettings
+    lookup (unlike _SettingsFakeDB, which also fronts a UserSettings lookup
+    update_user_settings does first - _settings_response takes settings
+    directly and only queries once)."""
+
+    def __init__(self, global_settings):
+        self._global_settings = global_settings
+
+    async def execute(self, stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: self._global_settings)
+
+
+class SettingsResponseEffectiveRadarrSonarrTests(unittest.IsolatedAsyncioTestCase):
+    """Regression: the Explore Movies/Shows Radarr/Sonarr filter (#171) was
+    shown regardless of whether Radarr/Sonarr was actually configured, since
+    nothing on the settings response said either way - unlike TMDB/TVDB,
+    which already have has_effective_*_key for exactly this. has_effective_
+    radarr/sonarr mirrors _effective_radarr/_effective_sonarr's own "all 4
+    fields set, user config first" rule (inlined to avoid a routers.media
+    <-> routers.auth cross-import)."""
+
+    def _user_settings(self, **radarr_sonarr_fields):
+        from models.users import UserSettings
+
+        return UserSettings(user_id=1, **radarr_sonarr_fields)
+
+    async def test_neither_configured_is_false(self) -> None:
+        settings = self._user_settings()
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(None))
+        self.assertFalse(result.has_effective_radarr)
+        self.assertFalse(result.has_effective_sonarr)
+
+    async def test_fully_configured_user_radarr_is_true(self) -> None:
+        settings = self._user_settings(
+            radarr_url="http://radarr.local", radarr_token="tok",
+            radarr_root_folder="/movies", radarr_quality_profile=1,
+        )
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(None))
+        self.assertTrue(result.has_effective_radarr)
+        self.assertFalse(result.has_effective_sonarr)
+
+    async def test_partially_configured_user_radarr_is_false(self) -> None:
+        # Missing quality_profile - the "all 4 fields" rule must not treat
+        # this as configured just because most fields are set.
+        settings = self._user_settings(
+            radarr_url="http://radarr.local", radarr_token="tok", radarr_root_folder="/movies",
+        )
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(None))
+        self.assertFalse(result.has_effective_radarr)
+
+    async def test_global_only_sonarr_is_true(self) -> None:
+        from models.global_settings import GlobalSettings
+
+        settings = self._user_settings()
+        gs = GlobalSettings(
+            id=1, sonarr_url="http://sonarr.local", sonarr_token="tok",
+            sonarr_root_folder="/tv", sonarr_quality_profile=1,
+        )
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(gs))
+        self.assertTrue(result.has_effective_sonarr)
+        self.assertFalse(result.has_effective_radarr)
+
+    async def test_global_mdblist_key_is_exposed_only_as_capability(self) -> None:
+        from models.global_settings import GlobalSettings
+
+        settings = self._user_settings()
+        gs = GlobalSettings(id=1, mdblist_api_key="server-secret")
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(gs))
+
+        self.assertTrue(result.has_global_mdblist_key)
+        self.assertFalse(result.mdblist_connected)
+        self.assertIsNone(result.mdblist_api_key)
+
+    async def test_user_config_does_not_need_global_settings_row_to_exist(self) -> None:
+        # gs is None (no GlobalSettings row at all) - must not crash on the
+        # `gs and all([...])` short-circuit when checking the global side.
+        settings = self._user_settings(
+            sonarr_url="http://sonarr.local", sonarr_token="tok",
+            sonarr_root_folder="/tv", sonarr_quality_profile=1,
+        )
+        result = await auth._settings_response(settings, _GlobalSettingsFakeDB(None))
+        self.assertTrue(result.has_effective_sonarr)
+
+
+class _RegisterFakeDB:
+    """Queues results for register()'s db.execute() calls in order: the
+    registration-allowed count check, the existing-user lookup, and the
+    is_first_user count check."""
+
+    def __init__(self, count: int, existing_user=None):
+        self._results = [count, existing_user, count]
+        self.commit = AsyncMock()
+        self.refresh = AsyncMock()
+        self.added: list = []
+
+    async def execute(self, stmt):
+        item = self._results.pop(0)
+        if isinstance(item, int):
+            return SimpleNamespace(scalar_one=lambda item=item: item)
+        return SimpleNamespace(scalar_one_or_none=lambda item=item: item)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def flush(self):
+        pass
+
+
+class RegisterRoleEscalationTests(unittest.IsolatedAsyncioTestCase):
+    """Regression (#226): role was taken directly from the registration
+    request body, and role == "admin" grants elevated access in several
+    routers independently of is_admin (comments.py, lists.py, profile.py) -
+    a self-registering user could escalate by posting {"role": "admin"}.
+    Calls register.__wrapped__ to bypass the @limiter.limit decorator, which
+    needs a real starlette Request; functools.wraps keeps the undecorated
+    function reachable there."""
+
+    async def test_role_admin_in_request_body_is_ignored_for_non_first_user(self) -> None:
+        from models.base import UserRole
+
+        db = _RegisterFakeDB(count=3)
+        user_in = schemas.UserCreate(
+            email="attacker@example.com",
+            username="attacker",
+            password="password123",
+            role=UserRole.admin,
+        )
+        with patch.object(auth.app_settings, "enable_registrations", True), \
+             patch.object(auth.app_settings, "registration_max_allowed_users", 0), \
+             patch.object(auth.app_settings, "require_email_validation", False):
+            new_user = await auth.register.__wrapped__(SimpleNamespace(), user_in, db)
+
+        self.assertEqual(new_user.role, UserRole.user)
+        self.assertFalse(new_user.is_admin)
+
+    async def test_first_user_still_becomes_admin_regardless_of_requested_role(self) -> None:
+        from models.base import UserRole
+
+        db = _RegisterFakeDB(count=0)
+        user_in = schemas.UserCreate(
+            email="first@example.com",
+            username="first",
+            password="password123",
+            role=UserRole.user,
+        )
+        with patch.object(auth.app_settings, "require_email_validation", False):
+            new_user = await auth.register.__wrapped__(SimpleNamespace(), user_in, db)
+
+        self.assertEqual(new_user.role, UserRole.admin)
+        self.assertTrue(new_user.is_admin)
 
 
 if __name__ == "__main__":

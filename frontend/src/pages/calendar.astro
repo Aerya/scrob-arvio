@@ -1,0 +1,215 @@
+---
+import Base from "../layouts/Base.astro";
+import FilterPanel from "../components/FilterPanel.astro";
+import { api, tmdbImageUrl, type CalendarEntry } from "../lib/api";
+import { ratingPosterUrl } from "../lib/posters";
+import { formatDate } from "../lib/format";
+import { m } from "../paraglide/messages.js";
+export const prerender = false;
+
+const { token } = Astro.locals;
+Astro.response.headers.set("Cache-Control", "no-store");
+
+// cached_only=true never blocks on a TMDB recompute (see backend/routers/
+// calendar.py) - it serves whatever cache is usable (same-day fresh, or up
+// to 48h stale with collected/watched still resolved live) so the page
+// renders real items on the very first response instead of an empty shell
+// a client script fills in after the fact. `cached: false` only happens for
+// a genuinely cold cache (first-ever visit, or >48h since the last load) -
+// that's the one case actually worth a client-side wait.
+// How far ahead to look (#467), remembered in a cookie so it survives reloads
+// and the server render can use it.
+const CALENDAR_DAY_CHOICES = [14, 30, 60, 90];
+const savedDays = Number(Astro.cookies.get("calendar_days")?.value);
+const lookaheadDays = CALENDAR_DAY_CHOICES.includes(savedDays) ? savedDays : 14;
+
+// Filters live in the URL like the other pages' FilterPanel. The Sonarr ones
+// are applied by the backend; Collected/Watched are applied below since each
+// entry already carries those flags.
+const arr = Astro.url.searchParams.getAll("arr");
+const collection = Astro.url.searchParams.get("collection") ?? "";
+const watch = Astro.url.searchParams.get("watch") ?? "";
+const sonarrOnly = arr.includes("in");
+const sonarrMonitored = arr.includes("monitored");
+
+let calendarData: Awaited<ReturnType<typeof api.calendar.get>> | null = null;
+let loadError = "";
+try {
+  calendarData = await api.calendar.get(token, true, lookaheadDays, sonarrOnly, sonarrMonitored);
+} catch (e: any) {
+  loadError = e.message;
+}
+
+// Only actually "needs" a client-side wait when there's no load error to
+// show instead - an error should never trigger the poll-and-reload loop.
+const sonarrConfigured = calendarData?.sonarr_configured ?? false;
+const needsCompute = !loadError && !calendarData?.cached;
+const entries = (calendarData?.calendar?.entries ?? []).filter((e) =>
+  (collection === "in" ? e.collected : collection === "out" ? !e.collected : true) &&
+  (watch === "watched" ? e.watched : watch === "unwatched" ? !e.watched : true)
+);
+const hasFilters = !!(arr.length || collection || watch);
+const todayIso = calendarData?.calendar?.today ?? new Date().toISOString().slice(0, 10);
+
+function dayLabel(iso: string, today: string): string {
+  const d = Date.UTC(...(iso.split('-').map(Number) as [number, number, number]));
+  const t = Date.UTC(...(today.split('-').map(Number) as [number, number, number]));
+  const diff = Math.round((d - t) / 86400000);
+  if (diff === 0) return m.common_today();
+  if (diff === 1) return m.common_tomorrow();
+  if (diff === -1) return m.common_yesterday();
+  return formatDate(iso + 'T00:00:00Z', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' });
+}
+
+function entryHref(e: CalendarEntry): string {
+  if (e.show_tmdb_id) return `/show/${e.show_tmdb_id}/season/${e.season_number}/${e.episode_number}`;
+  if (e.show_tvdb_id) return `/show/tvdb/${e.show_tvdb_id}/season/${e.season_number}/${e.episode_number}`;
+  return '#';
+}
+
+// Entries arrive pre-sorted by air_date (then title, season, episode) from
+// the backend - a plain object preserves that insertion order, so grouping
+// into it reproduces the same day-by-day ordering without re-sorting.
+const byDay: Record<string, CalendarEntry[]> = {};
+for (const e of entries) {
+  (byDay[e.air_date] ??= []).push(e);
+}
+const days = Object.keys(byDay);
+---
+
+<Base title={m.nav_calendar()}>
+  <div class="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <h1 class="page-title">{m.nav_calendar()}</h1>
+    <div class="flex flex-wrap items-center gap-2 sm:shrink-0">
+    <select
+      id="cal-days-select"
+      aria-label={m.calendar_days_select_label()}
+      class="px-3 py-2 text-sm font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-600 transition-all cursor-pointer"
+    >
+      {CALENDAR_DAY_CHOICES.map((d) => (
+        <option value={d} selected={d === lookaheadDays}>{m.calendar_next_days({ days: d })}</option>
+      ))}
+    </select>
+    <FilterPanel
+      id="calendar-filters"
+      basePath="/calendar"
+      sections={[
+        ...(sonarrConfigured ? [{
+          key: "arr", label: "Sonarr", selected: arr,
+          options: [{ value: "in", label: m.filter_in_sonarr() }, { value: "monitored", label: m.filter_monitored() }],
+        }] : []),
+        { key: "collection", label: m.filter_collection(), multi: false, selected: collection ? [collection] : [],
+          options: [{ value: "in", label: m.filter_collected_option() }, { value: "out", label: m.filter_not_collected_option() }] },
+        { key: "watch", label: m.filter_watched(), multi: false, selected: watch ? [watch] : [],
+          options: [{ value: "watched", label: m.filter_watched_option() }, { value: "unwatched", label: m.filter_unwatched_option() }] },
+      ]}
+    />
+    <button
+      id="cal-refresh-btn"
+      class="flex items-center gap-2 px-4 py-2 text-sm font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-600 hover:text-zinc-200 transition-all cursor-pointer shrink-0"
+    >
+      <svg id="cal-refresh-icon" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/>
+        <path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>
+      </svg>
+      <span>{m.common_refresh()}</span>
+    </button>
+    </div>
+  </div>
+
+  {loadError ? (
+    <div class="py-20 text-center text-zinc-500">{m.calendar_error()}</div>
+  ) : needsCompute ? (
+    <div id="cal-pending" class="py-20 text-center text-zinc-500">{m.calendar_loading()}</div>
+  ) : days.length === 0 ? (
+    <p class="text-zinc-500 text-center py-10">{hasFilters ? m.calendar_no_filter_match() : m.calendar_empty_days({ days: lookaheadDays })}</p>
+  ) : (
+    <div class="space-y-8">
+      {days.map((day) => (
+        <section>
+          <h2 class="group-label mb-3">{dayLabel(day, todayIso)} <span class="text-zinc-600 normal-case tracking-normal font-medium">· {day}</span></h2>
+          <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {byDay[day].map((e) => {
+              const sxe = e.season_number != null && e.episode_number != null
+                ? `S${String(e.season_number).padStart(2, '0')}E${String(e.episode_number).padStart(2, '0')}`
+                : '';
+              const poster = ratingPosterUrl(
+                tmdbImageUrl(e.poster_path, "w185"),
+                { type: "series", tmdb_id: e.show_tmdb_id ?? null, tvdb_id: e.show_tvdb_id ?? null },
+                Astro.locals.hasRpdbKey,
+              );
+              return (
+                <a href={entryHref(e)} class="flex items-center gap-4 p-3 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-blue-500/50 transition-colors">
+                  {poster ? (
+                    <img src={poster} alt="" class="w-10 rounded-md object-cover shrink-0" loading="lazy" decoding="async" style="height:60px" />
+                  ) : (
+                    <div class="w-10 shrink-0 flex items-center justify-center text-zinc-600" style="height:60px">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="45%" height="45%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="15" x="2" y="7" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>
+                    </div>
+                  )}
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2">
+                      <div class="font-bold text-zinc-100 truncate">{e.show_title}</div>
+                      {e.collected && <span class="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-purple-500/20 text-purple-400">{m.calendar_badge_collected()}</span>}
+                      {e.watched && <span class="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400">{m.calendar_badge_watched()}</span>}
+                    </div>
+                    <div class="text-sm text-zinc-500 truncate">{sxe && <span class="font-bold text-blue-400">{sxe}</span>} {sxe && '· '}{e.episode_name || m.common_tba()}</div>
+                  </div>
+                </a>
+              );
+            })}
+          </div>
+        </section>
+      ))}
+    </div>
+  )}
+
+  <p class="text-zinc-500 mt-8">{m.calendar_footer_days({ days: lookaheadDays })}</p>
+</Base>
+
+<script define:vars={{ token, needsCompute }}>
+  const refreshBtn = document.getElementById('cal-refresh-btn');
+  const refreshIcon = document.getElementById('cal-refresh-icon');
+
+  document.getElementById('cal-days-select')?.addEventListener('change', (e) => {
+    document.cookie = `calendar_days=${e.target.value}; path=/; max-age=31536000; samesite=lax`;
+    window.location.reload();
+  });
+
+  refreshBtn?.addEventListener('click', async () => {
+    refreshIcon?.classList.add('animate-spin');
+    refreshBtn.disabled = true;
+    try {
+      await fetch('/api/proxy/calendar/refresh', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+    } finally {
+      window.location.reload();
+    }
+  });
+
+  // Only present on a genuinely cold cache (first-ever visit) - poll until
+  // the background compute the server already kicked off finishes, then
+  // reload for a fresh server-rendered page. Everything else on this page
+  // is plain SSR with no client-side rendering at all.
+  if (needsCompute) {
+    (async () => {
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          const res = await fetch('/api/proxy/calendar?cached_only=true', {
+            headers: { 'Authorization': `Bearer ${token}` },
+          });
+          const data = await res.json();
+          if (data.cached) {
+            window.location.reload();
+            return;
+          }
+        } catch {
+          // keep polling - a transient failure here shouldn't strand the page
+        }
+      }
+    })();
+  }
+</script>

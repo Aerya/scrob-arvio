@@ -160,10 +160,13 @@ class CreateMediaSafelyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _FakeMedia:
-    def __init__(self, id, media_type, tmdb_id) -> None:
+    def __init__(self, id, media_type, tmdb_id, show_id=None, season_number=None, episode_number=None) -> None:
         self.id = id
         self.media_type = media_type
         self.tmdb_id = tmdb_id
+        self.show_id = show_id
+        self.season_number = season_number
+        self.episode_number = episode_number
 
 
 class ApplyMediaChangeSafelyTests(unittest.IsolatedAsyncioTestCase):
@@ -227,6 +230,43 @@ class ApplyMediaChangeSafelyTests(unittest.IsolatedAsyncioTestCase):
 
         result = await apply_media_change_safely(session, media, mutate)
         self.assertIs(result, existing)
+
+    async def test_conflict_between_twins_of_one_episode_merges_the_stub(self) -> None:
+        # #463: the stub that lost the tmdb_id race is the same episode as the
+        # winner (same show/season/number) - fold it in so it isn't re-enriched,
+        # and failing, on every sync.
+        existing = _FakeMedia(id=99, media_type=MediaType.episode, tmdb_id=42, show_id=5, season_number=2, episode_number=3)
+        session = _FakeSession(
+            flush_raises=IntegrityError("stmt", {}, Exception("duplicate key")),
+            existing_rows=[existing],
+        )
+        media = _FakeMedia(id=7, media_type=MediaType.episode, tmdb_id=None, show_id=5, season_number=2, episode_number=3)
+        loser = object()
+        session.get = AsyncMock(return_value=loser)
+
+        def mutate():
+            media.tmdb_id = 42
+
+        with patch("core.episode_order._merge_episode_media", AsyncMock()) as merge:
+            result = await apply_media_change_safely(session, media, mutate)
+        self.assertIs(result, existing)
+        merge.assert_awaited_once_with(session, existing, loser, rekey_comments=False)
+
+    async def test_conflict_with_a_different_episode_is_not_merged(self) -> None:
+        existing = _FakeMedia(id=99, media_type=MediaType.episode, tmdb_id=42, show_id=5, season_number=2, episode_number=4)
+        session = _FakeSession(
+            flush_raises=IntegrityError("stmt", {}, Exception("duplicate key")),
+            existing_rows=[existing],
+        )
+        media = _FakeMedia(id=7, media_type=MediaType.episode, tmdb_id=None, show_id=5, season_number=2, episode_number=3)
+
+        def mutate():
+            media.tmdb_id = 42
+
+        with patch("core.episode_order._merge_episode_media", AsyncMock()) as merge:
+            result = await apply_media_change_safely(session, media, mutate)
+        self.assertIs(result, existing)
+        merge.assert_not_awaited()
 
     async def test_conflict_unrelated_to_the_change_reraises(self) -> None:
         # If media.tmdb_id ended up unchanged, the flush failure came from
@@ -296,8 +336,9 @@ class EnrichMediaEpisodeTvdbFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
 
         get_tvdb_eps.assert_awaited_once_with(411, 4, "tvdb-key", language="eng")
-        # TVDB episode id stored in tmdb_id - existing convention (enrich_episode_from_tvdb).
-        self.assertEqual(media.tmdb_id, 9001)
+        # TVDB episode id lives in tvdb_id; tmdb_id stays unset (migration tvdb1st).
+        self.assertEqual(media.tvdb_id, 9001)
+        self.assertIsNone(media.tmdb_id)
         self.assertEqual(media.title, "TVDB Episode")
         self.assertEqual(media.tmdb_data.get("source"), "tvdb")
 
@@ -331,7 +372,8 @@ class EnrichMediaEpisodeTvdbFallbackTests(unittest.IsolatedAsyncioTestCase):
             await enrich_media(media, api_key="tmdb-key", tvdb_id=999, tvdb_api_key="tvdb-key")
 
         get_ep.assert_not_awaited()
-        self.assertEqual(media.tmdb_id, 100)
+        self.assertEqual(media.tvdb_id, 100)
+        self.assertIsNone(media.tmdb_id)
         self.assertEqual(media.tmdb_data.get("source"), "tvdb")
 
 
@@ -414,6 +456,68 @@ class EnrichMediaRuntimeColumnTests(unittest.IsolatedAsyncioTestCase):
         with patch("core.enrichment.tmdb.get_movie", AsyncMock(return_value=tmdb_data)):
             await enrich_media(media, api_key="tmdb-key")
         self.assertEqual(media.runtime, 120)
+
+
+class EnrichMediaCreditsStingerTests(unittest.IsolatedAsyncioTestCase):
+    """#319 - a movie's mid/post-credits scene keywords should land in
+    tmdb_data so the detail page can show a badge for it."""
+
+    async def test_stinger_keywords_are_stored_on_tmdb_data(self) -> None:
+        media = Media(media_type=MediaType.movie, tmdb_id=550)
+        tmdb_data = {
+            "title": "Fight Club",
+            "runtime": 139,
+            "keywords": {"keywords": [{"id": 1, "name": "aftercreditsstinger"}]},
+        }
+        with patch("core.enrichment.tmdb.get_movie", AsyncMock(return_value=tmdb_data)):
+            await enrich_media(media, api_key="tmdb-key")
+        self.assertFalse(media.tmdb_data["has_mid_credits_scene"])
+        self.assertTrue(media.tmdb_data["has_post_credits_scene"])
+
+    async def test_no_stinger_keywords_stores_false(self) -> None:
+        media = Media(media_type=MediaType.movie, tmdb_id=550)
+        tmdb_data = {"title": "Fight Club", "runtime": 139}
+        with patch("core.enrichment.tmdb.get_movie", AsyncMock(return_value=tmdb_data)):
+            await enrich_media(media, api_key="tmdb-key")
+        self.assertFalse(media.tmdb_data["has_mid_credits_scene"])
+        self.assertFalse(media.tmdb_data["has_post_credits_scene"])
+
+
+class EnrichMediaBypassCacheTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for: "Refresh Metadata" going through enrich_media
+    (the movie path) silently returned whatever TMDB response was already
+    sitting in the shared 30-minute cache, making the button a no-op if the
+    title had been fetched (e.g. just by browsing to it) moments earlier.
+    bypass_cache=True must reach the underlying tmdb.get_*(cache_ttl=None)
+    call for every branch enrich_media has."""
+
+    async def test_movie_bypass_cache_passes_cache_ttl_none(self) -> None:
+        media = Media(media_type=MediaType.movie, tmdb_id=550)
+        get_movie = AsyncMock(return_value={"title": "Fight Club"})
+        with patch("core.enrichment.tmdb.get_movie", get_movie):
+            await enrich_media(media, api_key="tmdb-key", bypass_cache=True)
+        self.assertIsNone(get_movie.call_args.kwargs["cache_ttl"])
+
+    async def test_movie_default_does_not_bypass_cache(self) -> None:
+        media = Media(media_type=MediaType.movie, tmdb_id=550)
+        get_movie = AsyncMock(return_value={"title": "Fight Club"})
+        with patch("core.enrichment.tmdb.get_movie", get_movie):
+            await enrich_media(media, api_key="tmdb-key")
+        self.assertIsNotNone(get_movie.call_args.kwargs["cache_ttl"])
+
+    async def test_series_bypass_cache_passes_cache_ttl_none(self) -> None:
+        media = Media(media_type=MediaType.series, tmdb_id=1399)
+        get_show = AsyncMock(return_value={"name": "Show"})
+        with patch("core.enrichment.tmdb.get_show", get_show):
+            await enrich_media(media, api_key="tmdb-key", bypass_cache=True)
+        self.assertIsNone(get_show.call_args.kwargs["cache_ttl"])
+
+    async def test_episode_bypass_cache_passes_cache_ttl_none(self) -> None:
+        media = Media(media_type=MediaType.episode, season_number=1, episode_number=1)
+        get_episode = AsyncMock(return_value={"id": 1, "name": "Pilot"})
+        with patch("core.enrichment.tmdb.get_episode", get_episode):
+            await enrich_media(media, api_key="tmdb-key", series_tmdb_id=999, bypass_cache=True)
+        self.assertIsNone(get_episode.call_args.kwargs["cache_ttl"])
 
 
 if __name__ == "__main__":

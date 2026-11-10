@@ -184,8 +184,10 @@ class ArvioApplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_arvio_watched_movie(self) -> None:
         db = AsyncMock()
         db.add = MagicMock()
+        db.get_bind = MagicMock(return_value=None)  # non-Postgres: skip the #440 dedup lock
         db.execute = AsyncMock(side_effect=[
             _Result(scalars=[]),  # Media search
+            _Result(scalars=[]),  # get_dedup_window_minutes lookup (#390)
             _Result(scalars=[]),  # WatchEvent search
         ])
 
@@ -198,12 +200,39 @@ class ArvioApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(added)
         self.assertEqual(db.add.call_count, 2)  # Media + WatchEvent
 
+    async def test_apply_arvio_watched_movie_falls_back_to_updated_at(self) -> None:
+        # Regression: a completed continue-watching movie item (routed here by
+        # _apply_arvio_playback_progress's high-completion branch) may only
+        # carry updatedAt, not watchedAt/timestamp/updatedAtMs - without this
+        # fallback the event's timestamp silently became "now" instead of the
+        # real watch time.
+        db = AsyncMock()
+        db.add = MagicMock()
+        db.get_bind = MagicMock(return_value=None)  # non-Postgres: skip the #440 dedup lock
+        db.execute = AsyncMock(side_effect=[
+            _Result(scalars=[]),  # Media search
+            _Result(scalars=[]),  # get_dedup_window_minutes lookup (#390)
+            _Result(scalars=[]),  # WatchEvent search
+        ])
+
+        added = await _apply_arvio_watched_movie(
+            db,
+            user_id=1,
+            item={"tmdbId": 550, "title": "Fight Club", "updatedAt": "2026-08-10T12:00:00Z"},
+            tmdb_api_key=None,
+        )
+        self.assertTrue(added)
+        event = next(c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], WatchEvent))
+        self.assertEqual(event.watched_at, datetime(2026, 8, 10, 12, 0, 0))
+
     async def test_apply_arvio_watched_episode(self) -> None:
         db = AsyncMock()
         db.add = MagicMock()
+        db.get_bind = MagicMock(return_value=None)  # non-Postgres: skip the #440 dedup lock
         db.execute = AsyncMock(side_effect=[
             _Result(scalars=[]),  # Show search
             _Result(scalars=[]),  # Media episode search
+            _Result(scalars=[]),  # get_dedup_window_minutes lookup (#390)
             _Result(scalars=[]),  # WatchEvent search
         ])
 
@@ -244,8 +273,10 @@ class ArvioApplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_arvio_watched_movie_int_item(self) -> None:
         db = AsyncMock()
         db.add = MagicMock()
+        db.get_bind = MagicMock(return_value=None)  # non-Postgres: skip the #440 dedup lock
         db.execute = AsyncMock(side_effect=[
             _Result(scalars=[]),  # Media search
+            _Result(scalars=[]),  # get_dedup_window_minutes lookup (#390)
             _Result(scalars=[]),  # WatchEvent search
         ])
 
@@ -262,14 +293,22 @@ class ArvioApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(arvio._extract_profile_data({"0": ["item1"]}, "0"), ["item1"])
         self.assertEqual(arvio._extract_profile_data({"profile_0": ["item1"]}, "0"), ["item1"])
         self.assertEqual(arvio._extract_profile_data({"uuid-123": ["item1"]}, "0"), ["item1"])
-        self.assertEqual(arvio._extract_profile_data({"p1": ["a"], "p2": ["b"]}, "0"), ["a", "b"])
+
+    def test_extract_profile_data_fails_safe_on_multi_profile_mismatch(self) -> None:
+        # A multi-profile dict where profile_id matches none of the keys must
+        # return [] rather than combine every profile's data together - doing
+        # so would leak another profile's watch history into this one on a
+        # multi-profile ARVIO account.
+        self.assertEqual(arvio._extract_profile_data({"p1": ["a"], "p2": ["b"]}, "0"), [])
 
     async def test_apply_arvio_watched_episode_formats(self) -> None:
         db = AsyncMock()
         db.add = MagicMock()
+        db.get_bind = MagicMock(return_value=None)  # non-Postgres: skip the #440 dedup lock
         db.execute = AsyncMock(side_effect=[
             _Result(scalars=[]),  # Show search
             _Result(scalars=[]),  # Media episode search
+            _Result(scalars=[]),  # get_dedup_window_minutes lookup (#390)
             _Result(scalars=[]),  # WatchEvent search
         ])
 

@@ -9,13 +9,15 @@ from db import get_db
 from models.comments import Comment
 from models.users import User
 from models.profile import UserProfileData, PrivacyLevel
+from models.global_settings import GlobalSettings
 from dependencies import get_current_user, get_optional_user
 
 router = APIRouter()
 
 class CommentCreate(BaseModel):
     media_type: str
-    tmdb_id: int
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
     content: str
@@ -38,12 +40,15 @@ class CommentResponse(BaseModel):
 @router.get("")
 async def list_comments(
     media_type: str,
-    tmdb_id: int,
+    tmdb_id: Optional[int] = None,
+    tvdb_id: Optional[int] = None,
     season_number: Optional[int] = None,
     episode_number: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
+    if (tmdb_id is None) == (tvdb_id is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of tmdb_id or tvdb_id")
     query = (
         select(Comment)
         .join(User, Comment.user_id == User.id)
@@ -51,7 +56,7 @@ async def list_comments(
         .options(joinedload(Comment.user).joinedload(User.profile))
         .where(
             Comment.media_type == media_type,
-            Comment.tmdb_id == tmdb_id,
+            Comment.tmdb_id == tmdb_id if tmdb_id is not None else Comment.tvdb_id == tvdb_id,
             Comment.season_number == season_number,
             Comment.episode_number == episode_number,
         )
@@ -90,6 +95,8 @@ async def list_comments(
             "is_spoiler": c.is_spoiler,
             "created_at": c.created_at.isoformat(),
             "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+            "wetrakr_comment_id": c.wetrakr_comment_id,
+            "wetrakr_source": (c.wetrakr_source or "wetrakr") if c.wetrakr_comment_id else None,
         }
         for c in comments
     ]
@@ -102,11 +109,20 @@ async def create_comment(
 ):
     if not body.content.strip():
         raise HTTPException(status_code=400, detail="Comment content cannot be empty")
-        
+    if (body.tmdb_id is None) == (body.tvdb_id is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of tmdb_id or tvdb_id")
+
+    # The UI already hides the whole section when disabled (#301) - this is
+    # just so a direct API call can't post one anyway.
+    gs = (await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))).scalar_one_or_none()
+    if gs and gs.disable_comments:
+        raise HTTPException(status_code=403, detail="Comments are disabled on this server")
+
     comment = Comment(
         user_id=current_user.id,
         media_type=body.media_type,
         tmdb_id=body.tmdb_id,
+        tvdb_id=body.tvdb_id,
         season_number=body.season_number,
         episode_number=body.episode_number,
         content=body.content,

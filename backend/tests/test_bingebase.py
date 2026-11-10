@@ -84,3 +84,13 @@ class BingebaseScrobbleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(result)
+
+
+class BingebaseScheduleSettingsTests(unittest.TestCase):
+    def test_interval_can_be_disabled_and_cannot_create_busy_loop(self):
+        from schemas import UserSettings
+        from pydantic import ValidationError
+        self.assertIsNone(UserSettings(bingebase_auto_push_interval=None).bingebase_auto_push_interval)
+        self.assertEqual(UserSettings(bingebase_auto_push_interval=1).bingebase_auto_push_interval, 1)
+        with self.assertRaises(ValidationError):
+            UserSettings(bingebase_auto_push_interval=0)

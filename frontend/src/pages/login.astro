@@ -1,7 +1,13 @@
 ---
 import Base from "../layouts/Base.astro";
+import PosterWall from "../components/PosterWall.astro";
+import AuthHero from "../components/AuthHero.astro";
+import AuthMobileFeatures from "../components/AuthMobileFeatures.astro";
 import { api } from "../lib/api";
 import type { OidcConfig } from "../lib/api";
+import LanguagePicker from "../components/LanguagePicker.astro";
+import { escapeHtml } from "../lib/format";
+import { m } from "../paraglide/messages.js";
 
 let error = "";
 let success = "";
@@ -16,9 +22,16 @@ const oidcConfig: OidcConfig = await api.auth.oidcConfig().catch(() => ({
 
 const { enabled: registrationEnabled, smtp_configured: smtpConfigured } = await api.auth.registrationStatus().catch(() => ({ enabled: false, smtp_configured: false }));
 const { has_users: hasUsers } = await api.auth.hasUsers().catch(() => ({ has_users: true }));
+const { enable_logged_out_navigation: showNav } = await api.profile.publicAccessStatus().catch(() => ({ enable_logged_out_navigation: false }));
+
+// Only a same-site path is a safe redirect target - anything else (an
+// absolute URL, or a protocol-relative "//evil.com") could send a
+// successful login to an attacker-controlled site.
+const rawNext = Astro.url.searchParams.get("next") || "";
+const nextPath = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
 
 if (Astro.url.searchParams.get("restored") === "true") {
-  success = "Database restored successfully. You can now log in.";
+  success = m.auth_restored();
 }
 
 const oidcError = Astro.url.searchParams.get("oidc_error");
@@ -28,23 +41,30 @@ if (oidcError) {
 
 const urlError = Astro.url.searchParams.get("error");
 if (urlError === "invalid_activation_token") {
-  error = "This activation link is invalid.";
+  error = m.auth_activation_invalid();
 } else if (urlError === "activation_token_expired") {
-  error = "This activation link has expired. Please register again or contact an administrator.";
+  error = m.auth_activation_expired();
 }
 
 if (Astro.url.searchParams.get("email_activated") === "true") {
-  success = "Your email has been confirmed! You can now sign in.";
+  success = m.auth_email_confirmed();
 }
 
 if (Astro.url.searchParams.get("password_reset") === "true") {
-  success = "Your password has been reset. You can now sign in with your new password.";
+  success = m.auth_password_reset_done();
 }
 
 
 if (Astro.request.method === "POST") {
   const data = await Astro.request.formData();
   const step = (data.get("_step") as string) || "login";
+
+  // The hidden field, not the query string, is authoritative here - it's
+  // what the form that was actually rendered (and might have moved through
+  // the 2FA step) carried, rather than assuming the POST landed back on the
+  // same URL the page was first loaded with.
+  const submittedNext = (data.get("_next") as string) || "";
+  const postNext = submittedNext.startsWith("/") && !submittedNext.startsWith("//") ? submittedNext : nextPath;
 
   if (step === "login") {
     try {
@@ -57,12 +77,12 @@ if (Astro.request.method === "POST") {
           path: "/",
           httpOnly: true,
           sameSite: "lax",
-          maxAge: 60 * 60 * 24 * 7,
+          maxAge: result.expires_in ?? 60 * 60 * 24 * 7,
         });
-        return Astro.redirect("/");
+        return Astro.redirect(postNext);
       }
     } catch (e: unknown) {
-      error = e instanceof Error ? e.message : "Login failed";
+      error = e instanceof Error ? e.message : m.auth_login_failed();
     }
   } else if (step === "verify_2fa") {
     const submittedTempToken = (data.get("temp_token") as string) || "";
@@ -74,12 +94,12 @@ if (Astro.request.method === "POST") {
           path: "/",
           httpOnly: true,
           sameSite: "lax",
-          maxAge: 60 * 60 * 24 * 7,
+          maxAge: result.expires_in ?? 60 * 60 * 24 * 7,
         });
-        return Astro.redirect("/");
+        return Astro.redirect(postNext);
       }
     } catch (e: unknown) {
-      error = e instanceof Error ? e.message : "Verification failed";
+      error = e instanceof Error ? e.message : m.auth_verification_failed();
       showTotpStep = true;
       tempToken = submittedTempToken;
     }
@@ -88,31 +108,48 @@ if (Astro.request.method === "POST") {
 
 const token = Astro.cookies.get("token")?.value;
 if (token) {
-  return Astro.redirect("/");
+  return Astro.redirect(nextPath);
 }
+
+// When the nav bar renders (logged-out navigation enabled), it adds real
+// height above this section that the fixed 9rem/5rem budget below doesn't
+// know about - without this, the page overflows by the nav's height even
+// though the hero content itself fits the viewport.
+const heroMinHeightClass = showNav
+  ? "min-h-[calc(100dvh-14rem)] md:min-h-[calc(100dvh-10rem)]"
+  : "min-h-[calc(100dvh-9rem)] md:min-h-[calc(100dvh-5rem)]";
 ---
 
-<Base title="Login" hideNav>
-  <div class="max-w-md mx-auto mt-16 p-8 bg-zinc-900 rounded-xl border border-zinc-800 shadow-2xl relative">
-    <button
-      id="theme-toggle"
-      tabindex="1"
-      class="absolute top-4 right-4 p-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-zinc-100 transition-all hover:scale-110 active:scale-95"
-      aria-label="Toggle Theme"
-    >
-      <span id="sun-icon" class="hidden">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-      </span>
-      <span id="moon-icon">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-      </span>
-    </button>
-    <div class="flex flex-col items-center mb-6">
-      <img src="/scrob.png" alt="Scrob Logo" class="w-36 object-contain mb-2" />
-      <span class="text-zinc-100 font-bold text-xl tracking-tight">Scrob</span>
-    </div>
-    <h1 class="text-3xl font-bold mb-6 text-zinc-100 text-center">Login</h1>
-    
+<Base title={m.auth_welcome()} hideNav={!showNav}>
+  <!-- Decorative poster-wall background (full viewport, behind content) -->
+  <PosterWall />
+
+  {!showNav && (
+  <button
+    id="theme-toggle"
+    tabindex="1"
+    class="fixed top-4 right-4 z-20 p-2 rounded-lg bg-zinc-900/80 backdrop-blur-sm border border-zinc-700 text-zinc-400 hover:text-zinc-100 transition-all hover:scale-110 active:scale-95"
+    aria-label={m.nav_toggle_theme()}
+  >
+    <span id="sun-icon" class="hidden">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+    </span>
+    <span id="moon-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+    </span>
+  </button>
+  )}
+
+  <div class={`relative z-10 ${heroMinHeightClass} flex items-center py-6 md:py-10`}>
+    <div class="w-full grid md:grid-cols-2 gap-8 md:gap-12 lg:gap-20 items-center">
+
+      <AuthHero />
+
+      <!-- Login card -->
+      <div class="w-full max-w-md mx-auto md:justify-self-end">
+        <div class="p-8 bg-zinc-900/85 backdrop-blur-md rounded-xl border border-zinc-800 shadow-2xl">
+    <h2 class="text-2xl font-bold mb-6 text-zinc-100 text-center">{m.auth_sign_in()}</h2>
+
     {error && (
       <div class="bg-red-500/10 border border-red-500 text-red-500 p-3 rounded-lg mb-6">
         {error}
@@ -130,15 +167,27 @@ if (token) {
         {/* OIDC button */}
         {oidcConfig.enabled && (
           <a
-            href="/oidc-start"
+            id="oidc-login-link"
+            href={`/oidc-start?next=${encodeURIComponent(nextPath)}`}
             tabindex="2"
             class="flex items-center justify-center gap-2 w-full bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-100 font-bold py-2 rounded-lg transition-colors cursor-pointer mb-4"
           >
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4">
               <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
             </svg>
-            Login with {oidcConfig.provider_name}
+            {m.auth_login_with({ provider: oidcConfig.provider_name })}
           </a>
+        )}
+
+        {/* SSO-only installs have no password form to carry the checkbox */}
+        {oidcConfig.enabled && oidcConfig.disable_password_login && (
+          <label class="mb-4 flex items-center justify-between gap-4 px-4 py-3 bg-zinc-900/60 rounded-lg border border-zinc-800 cursor-pointer select-none">
+              <span class="text-sm text-zinc-300">{m.auth_stay_logged_in()}</span>
+              <span class="relative inline-flex items-center shrink-0">
+                <input type="checkbox" role="switch" id="remember-me" tabindex="3" class="sr-only peer" />
+                <div class="w-11 h-6 bg-zinc-700 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+              </span>
+            </label>
         )}
 
         {/* Divider when both options are visible */}
@@ -148,7 +197,7 @@ if (token) {
               <div class="w-full border-t border-zinc-800"></div>
             </div>
             <div class="relative flex justify-center">
-              <span class="bg-zinc-900 px-3 text-xs text-zinc-400">or</span>
+              <span class="bg-zinc-900 px-3 text-xs text-zinc-400">{m.common_or()}</span>
             </div>
           </div>
         )}
@@ -157,12 +206,14 @@ if (token) {
         {!oidcConfig.disable_password_login && (
           <form method="POST" class="space-y-4">
             <input type="hidden" name="_step" value="login" />
+            <input type="hidden" name="_next" value={nextPath} />
             <div>
-              <label for="username" class="block text-sm font-medium text-zinc-400 mb-1">Username</label>
+              <label for="username" class="block text-sm font-medium text-zinc-400 mb-1">{m.auth_username()}</label>
               <input
                 type="text"
                 name="username"
                 id="username"
+                autocomplete="username"
                 required
                 tabindex="3"
                 class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
@@ -170,9 +221,9 @@ if (token) {
             </div>
             <div>
             <div class="flex items-center justify-between">
-                <label for="password" class="block text-sm font-medium text-zinc-400">Password</label>
+                <label for="password" class="block text-sm font-medium text-zinc-400">{m.auth_password()}</label>
                 {smtpConfigured && (
-                  <a href="/forgot-password" tabindex="7" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">Forgot password?</a>
+                  <a href="/forgot-password" tabindex="7" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">{m.auth_forgot_password()}</a>
                 )}
               </div>
               <div class="relative group/field">
@@ -180,6 +231,7 @@ if (token) {
                   type="password"
                   name="password"
                   id="password"
+                  autocomplete="current-password"
                   required
                   tabindex="4"
                   class="w-full bg-zinc-800 border border-zinc-700 rounded-lg pl-4 pr-10 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
@@ -188,7 +240,7 @@ if (token) {
                   type="button"
                   tabindex="5"
                   class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 p-1 cursor-pointer transition-colors"
-                  aria-label="Toggle password visibility"
+                  aria-label={m.auth_toggle_password()}
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 eye-icon">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.644C3.412 7.943 7.213 5 12 5c4.787 0 8.588 2.943 9.964 6.678.066.18.066.362 0 .544C20.588 16.057 16.787 19 12 19c-4.787 0-8.588-2.943-9.964-6.678z" />
@@ -200,19 +252,26 @@ if (token) {
                 </button>
               </div>
             </div>
+            <label class="mt-1 flex items-center justify-between gap-4 px-4 py-3 bg-zinc-900/60 rounded-lg border border-zinc-800 cursor-pointer select-none">
+              <span class="text-sm text-zinc-300">{m.auth_stay_logged_in()}</span>
+              <span class="relative inline-flex items-center shrink-0">
+                <input type="checkbox" role="switch" id="remember-me" name="remember" tabindex="6" class="sr-only peer" />
+                <div class="w-11 h-6 bg-zinc-700 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+              </span>
+            </label>
             <button
               type="submit"
               tabindex="6"
               class="w-full bg-zinc-100 text-zinc-950 font-bold py-2 rounded-lg hover:bg-zinc-200 transition-colors cursor-pointer mt-4"
             >
-              Sign In
+              {m.auth_sign_in_button()}
             </button>
           </form>
         )}
 
         {!oidcConfig.disable_password_login && registrationEnabled && (
           <div class="mt-6 text-center text-sm text-zinc-500">
-            Don't have an account? <a href="/register" tabindex="8" class="text-zinc-100 hover:underline">Register</a>
+            <Fragment set:html={m.auth_no_account({ link: `<a href="/register" tabindex="8" class="text-zinc-100 hover:underline">${escapeHtml(m.auth_register())}</a>` })} />
           </div>
         )}
       </>
@@ -220,16 +279,17 @@ if (token) {
       <form method="POST" class="space-y-4">
         <input type="hidden" name="_step" value="verify_2fa" />
         <input type="hidden" name="temp_token" value={tempToken} />
+        <input type="hidden" name="_next" value={nextPath} />
         <div class="text-center mb-2">
           <div class="w-12 h-12 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-3">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-6 h-6 text-zinc-300">
               <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
             </svg>
           </div>
-          <p class="text-sm text-zinc-400">Enter the 6-digit code from your authenticator app, or a backup code.</p>
+          <p class="text-sm text-zinc-400">{m.auth_totp_prompt()}</p>
         </div>
         <div>
-          <label for="totp_code" class="block text-sm font-medium text-zinc-400 mb-1">Verification Code</label>
+          <label for="totp_code" class="block text-sm font-medium text-zinc-400 mb-1">{m.auth_verification_code()}</label>
           <input
             type="text"
             name="totp_code"
@@ -237,7 +297,7 @@ if (token) {
             required
             autocomplete="one-time-code"
             inputmode="numeric"
-            placeholder="000000 or XXXX-XXXX"
+            placeholder={m.auth_totp_placeholder()}
             class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all text-center tracking-widest text-lg font-mono"
           />
         </div>
@@ -245,63 +305,89 @@ if (token) {
           type="submit"
           class="w-full bg-zinc-100 text-zinc-950 font-bold py-2 rounded-lg hover:bg-zinc-200 transition-colors cursor-pointer mt-4"
         >
-          Verify
+          {m.auth_verify()}
         </button>
         <div class="text-center">
-          <a href="/login" class="text-sm text-zinc-500 hover:text-zinc-300 transition-colors">Back to login</a>
+          <a href={`/login?next=${encodeURIComponent(nextPath)}`} class="text-sm text-zinc-500 hover:text-zinc-300 transition-colors">{m.auth_back_to_login()}</a>
         </div>
       </form>
     )}
-  </div>
-
-  {!hasUsers && (
-    <div class="max-w-md mx-auto mt-4 mb-12">
-      <div class="flex items-center gap-3 mb-4">
-        <div class="flex-1 border-t border-zinc-800"></div>
-        <span class="text-xs text-zinc-600">or restore from backup</span>
-        <div class="flex-1 border-t border-zinc-800"></div>
-      </div>
-      <div class="p-6 bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl">
-        <h2 class="font-semibold text-zinc-100 mb-1">Restore Database</h2>
-        <p class="text-sm text-zinc-400 mb-4">Upload a <code class="text-zinc-300">.bak</code> file to restore a previous installation.</p>
-        <div class="flex flex-col gap-3">
-          <input id="bootstrap-restore-file" type="file" accept=".bak"
-            class="block w-full text-sm text-zinc-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-zinc-800 file:text-zinc-300 hover:file:bg-zinc-700 file:cursor-pointer cursor-pointer" />
-          <button id="bootstrap-restore-btn" disabled
-            class="w-full px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white text-sm font-semibold rounded-xl transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
-            Restore Database
-          </button>
         </div>
-        <div id="bootstrap-restore-error" class="hidden mt-3 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2"></div>
+
+        <div class="mt-4 flex justify-center">
+          <LanguagePicker />
+        </div>
+
+        {!hasUsers && (
+          <div class="mt-4">
+            <div class="flex items-center gap-3 mb-4">
+              <div class="flex-1 border-t border-zinc-800"></div>
+              <span class="text-xs text-zinc-600">{m.auth_or_restore()}</span>
+              <div class="flex-1 border-t border-zinc-800"></div>
+            </div>
+            <div class="p-6 bg-zinc-900/85 backdrop-blur-md border border-zinc-800 rounded-xl shadow-2xl">
+              <h2 class="font-semibold text-zinc-100 mb-1">{m.auth_restore_database()}</h2>
+              <p class="text-sm text-zinc-400 mb-4" set:html={m.auth_restore_hint()} />
+              <div class="flex flex-col gap-3">
+                <input id="bootstrap-restore-file" type="file" accept=".bak"
+                  class="block w-full text-sm text-zinc-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-zinc-800 file:text-zinc-300 hover:file:bg-zinc-700 file:cursor-pointer cursor-pointer" />
+                <button id="bootstrap-restore-btn" disabled
+                  class="w-full px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white text-sm font-semibold rounded-xl transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
+                  {m.auth_restore_database()}
+                </button>
+              </div>
+              <div id="bootstrap-restore-error" class="hidden mt-3 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2"></div>
+            </div>
+          </div>
+        )}
+
+        <AuthMobileFeatures />
       </div>
     </div>
-  )}
+  </div>
 </Base>
-
 <!-- Bootstrap Restore Confirmation Modal -->
 <div id="bootstrap-restore-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4">
   <div id="bootstrap-restore-modal-backdrop" class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
   <div class="relative bg-zinc-900 border border-zinc-800 rounded-3xl p-8 w-full max-w-md shadow-2xl">
-    <h2 class="text-xl font-black text-zinc-100 mb-2">Restore Database?</h2>
-    <p class="text-sm text-zinc-400 mb-1">Restoring from:</p>
+    <h2 class="text-xl font-black text-zinc-100 mb-2">{m.auth_restore_confirm_title()}</h2>
+    <p class="text-sm text-zinc-400 mb-1">{m.auth_restoring_from()}</p>
     <p id="bootstrap-restore-modal-filename" class="text-sm text-zinc-100 font-medium mb-4 break-all"></p>
     <div class="bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3 mb-6">
-      <p class="text-sm text-red-400 font-medium">All existing data will be permanently overwritten. This cannot be undone.</p>
+      <p class="text-sm text-red-400 font-medium">{m.auth_restore_warning()}</p>
     </div>
     <div class="flex gap-3">
       <button type="button" id="bootstrap-restore-cancel-btn"
         class="flex-1 px-4 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-bold rounded-xl transition-colors text-sm cursor-pointer">
-        Cancel
+        {m.common_cancel()}
       </button>
       <button type="button" id="bootstrap-restore-confirm-btn"
         class="flex-1 px-4 py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl transition-colors text-sm cursor-pointer">
-        Restore
+        {m.auth_restore()}
       </button>
     </div>
   </div>
 </div>
 
 <script>
+  import { m } from '../paraglide/messages.js';
+
+  // "Stay logged in" also applies to SSO: carry the choice through /oidc-start,
+  // which hands it to the callback in a short-lived cookie.
+  function setupRememberForSso() {
+    const link = document.getElementById('oidc-login-link') as HTMLAnchorElement | null;
+    const box = document.getElementById('remember-me') as HTMLInputElement | null;
+    if (!link || !box) return;
+    link.addEventListener('click', (event) => {
+      const url = new URL(link.href, window.location.origin);
+      if (box.checked) url.searchParams.set('remember', '1');
+      else url.searchParams.delete('remember');
+      event.preventDefault();
+      window.location.href = url.pathname + url.search;
+    });
+  }
+  setupRememberForSso();
+
   function setupPasswordToggles() {
     const toggles = document.querySelectorAll('.password-toggle');
     toggles.forEach(toggle => {
@@ -357,7 +443,7 @@ if (token) {
       if (!file) return;
       closeModal();
       bootstrapBtn!.disabled = true;
-      bootstrapBtn!.textContent = 'Restoring…';
+      bootstrapBtn!.textContent = m.auth_restoring();
       document.getElementById('bootstrap-restore-error')!.classList.add('hidden');
       try {
         const fd = new FormData();
@@ -365,15 +451,15 @@ if (token) {
         const res = await fetch('/api/proxy/auth/bootstrap-restore', { method: 'POST', body: fd });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          throw new Error(data.detail || 'Restore failed');
+          throw new Error(data.detail || m.auth_restore_failed());
         }
         window.location.href = '/login?restored=true';
       } catch (err: unknown) {
         const errEl = document.getElementById('bootstrap-restore-error')!;
-        errEl.textContent = err instanceof Error ? err.message : 'Restore failed';
+        errEl.textContent = err instanceof Error ? err.message : m.auth_restore_failed();
         errEl.classList.remove('hidden');
         bootstrapBtn!.disabled = false;
-        bootstrapBtn!.textContent = 'Restore Database';
+        bootstrapBtn!.textContent = m.auth_restore_database();
       }
     });
   }

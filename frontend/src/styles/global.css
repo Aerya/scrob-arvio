@@ -33,9 +33,16 @@
   --color-text-base: #f4f4f5;     /* zinc-100 */
   --color-text-primary: #e4e4e7;  /* zinc-200 */
   --color-text-secondary: #d4d4d8;/* zinc-300 */
-  --color-text-description: #a1a1aa; /* zinc-400 */
-  --color-text-muted: #71717a;    /* zinc-500 */
-  --color-text-dim: #52525b;      /* zinc-600 */
+  /* On this near-black background the three secondary tiers were too dark:
+     zinc-400 (#a1a1aa ~6.8:1), zinc-500 (#71717a ~3.6:1), zinc-600
+     (#52525b ~2.3:1) - only the first cleared WCAG AA, and none read
+     comfortably. They were never far enough apart here to be worth it, so
+     all three now share one readable grey (~8.5:1, between zinc-300 and
+     zinc-400). The bright end (base/primary/secondary) still carries the
+     hierarchy. */
+  --color-text-description: #b4b4bb;
+  --color-text-muted: #b4b4bb;
+  --color-text-dim: #b4b4bb;
 
   --color-brand-jellyfin: #a855f7; /* purple-500 */
   --color-brand-plex: #eab308;    /* yellow-500 */
@@ -99,8 +106,10 @@ html.light {
   --color-text-primary: #1f2937;  /* gray-800 */
   --color-text-secondary: #374151;/* gray-700 */
   --color-text-description: #4b5563; /* gray-600 */
+  /* dim was gray-400 (#9ca3af, ~2.6:1 on white) - below WCAG AA. Matched to
+     muted (gray-500), same as the dark theme above. */
   --color-text-muted: #6b7280;    /* gray-500 */
-  --color-text-dim: #9ca3af;      /* gray-400 */
+  --color-text-dim: #6b7280;      /* gray-500 */
   
   --color-brand-jellyfin: #7e22ce; /* purple-700 */
   --color-brand-plex: #a16207;    /* yellow-700 (darker yellow for contrast) */
@@ -110,6 +119,8 @@ html.light {
 html {
   /* Fill notch/rounded-corner areas */
   background-color: var(--color-bg-page);
+  /* Anchor/scrollIntoView targets land below the pinned top nav. */
+  scroll-padding-top: var(--nav-h, 0px);
 }
 
 body {
@@ -131,6 +142,22 @@ img, a {
   -webkit-touch-callout: none;
 }
 
+/* Native <select> arrow sits jammed against the right border and can't be
+   spaced with padding. Replace it everywhere with a custom chevron that has real
+   breathing room. The [class] selector is only to out-specify Tailwind's px-*
+   utilities for padding-right (every <select> in the app carries a class). */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke-width='2' stroke='%2371717a'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19.5 8.25l-7.5 7.5-7.5-7.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.875rem center;
+  background-size: 1rem;
+}
+select[class] {
+  padding-right: 2.75rem;
+}
+
 /* Safe area for bottom nav on iOS */
 .safe-area-bottom {
   padding-bottom: env(safe-area-inset-bottom);
@@ -142,7 +169,9 @@ img, a {
 
 .sticky-top-safe {
   position: sticky;
-  top: env(safe-area-inset-top);
+  /* --nav-h is the pinned top nav's height (set in Base.astro); it already
+     includes the safe-area inset, so it replaces it rather than adding to it. */
+  top: var(--nav-h, env(safe-area-inset-top));
 }
 
 /* ── Mobile input improvements ─────────────────────────────────────────────
@@ -231,7 +260,46 @@ html.light [data-action="request"][data-state="active"]:hover {
   background-color: #ffedd5; color: #7c2d12; /* orange-100 / orange-900 */
 }
 
+/* Rewatch (indigo) */
+html.light [data-action="rewatch"][data-state="inactive"]:hover {
+  background-color: #e0e7ff; color: #312e81; /* indigo-100 / indigo-900 */
+}
+html.light [data-action="rewatch"][data-state="active"] {
+  background-color: #c7d2fe; color: #312e81; /* indigo-200 / indigo-900 */
+}
+html.light [data-action="rewatch"][data-state="active"]:hover {
+  background-color: #e0e7ff; color: #312e81; /* indigo-100 / indigo-900 */
+}
+
+/* Drop (rose) */
+html.light [data-action="drop"][data-state="inactive"]:hover {
+  background-color: #ffe4e6; color: #881337; /* rose-100 / rose-900 */
+}
+html.light [data-action="drop"][data-state="active"] {
+  background-color: #fecdd3; color: #881337; /* rose-200 / rose-900 */
+}
+html.light [data-action="drop"][data-state="active"]:hover {
+  background-color: #ffe4e6; color: #881337; /* rose-100 / rose-900 */
+}
+
+/* Network/studio logo swatch (show/movie badges, /network & /studio pages,
+   discover row, search results) - always a light backing so dark-colored
+   logos stay legible regardless of theme. Less translucent in dark mode,
+   where the near-black page behind it would otherwise wash the white toward
+   gray and undo the contrast it's there for. */
+.logo-swatch { background-color: rgba(255, 255, 255, 0.85); }
+html.light .logo-swatch { background-color: rgba(255, 255, 255, 0.6); }
+
 html.light .item-rating { color: #fbbf24; /* amber-400 */ }
+
+/* Post/mid-credits scene badge - amber-400 text is illegible on a white
+   surface, same issue as the Now Playing status labels above. */
+html.light .credits-scene-badge {
+  background-color: #fef3c7; /* amber-100 */
+  border-color: #fde68a;     /* amber-200 */
+  color: #78350f;            /* amber-900 */
+}
+html.light .credits-scene-icon { color: #b45309; /* amber-700 */ }
 
 /* Transitions for theme switching */
 body {
@@ -261,6 +329,17 @@ nav, div, a, button, input, span {
 .scrollbar-none.is-dragging * {
   cursor: grabbing;
   pointer-events: none; /* Prevent link clicks while dragging */
+}
+
+/* Plain scrollbar hiding for an ordinary vertical list (search results
+   dropdowns, etc.) - unlike .scrollbar-none above, this carries none of the
+   grab-cursor/drag-to-scroll behavior meant for horizontal media rows. */
+.scrollbar-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none;
 }
 
 /* ── Explicit content blur ──────────────────────────────────────────────── */
@@ -304,6 +383,33 @@ html.blur-explicit [data-adult-backdrop="true"] img {
 .section-headline::before {
   content: '';
   @apply block w-1 h-6 bg-blue-600 rounded-full shrink-0;
+}
+
+/* Rating popover (#470): print each star's value under it so 6 vs 7 is
+   unambiguous. currentColor follows the star, so the numbers light up amber
+   with the filled stars and on hover. */
+#rating-stars {
+  padding-bottom: 18px;
+}
+
+#rating-stars > button[data-value] {
+  position: relative;
+  overflow: visible;
+}
+
+#rating-stars > button[data-value]::after {
+  content: attr(data-value);
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+  pointer-events: none;
+  user-select: none;
 }
 
 .group-label {

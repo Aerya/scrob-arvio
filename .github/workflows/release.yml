@@ -6,6 +6,7 @@ on:
 
 jobs:
   release:
+    if: github.repository == 'ellite/scrob'
     name: Semantic release
     runs-on: ubuntu-latest
     permissions:
@@ -27,6 +28,9 @@ jobs:
       - name: Run semantic-release
         id: release
         uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

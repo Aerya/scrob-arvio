@@ -1,6 +1,11 @@
 ---
 import type { ContinueWatchingItem } from "../lib/api";
 import { tmdbImageUrl } from "../lib/api";
+import { ratingPosterUrl } from "../lib/posters";
+import { episodeHref } from "../lib/episodeHref";
+import { episodeCode } from "../lib/media-format";
+import { m } from "../paraglide/messages.js";
+import PosterFallback from "./PosterFallback.astro";
 
 interface Props {
   item: ContinueWatchingItem;
@@ -10,25 +15,17 @@ const { item } = Astro.props;
 const { media, progress_percent } = item;
 
 const isEpisode = media.type === "episode";
-const sxe =
-  isEpisode && media.season_number != null && media.episode_number != null
-    ? `S${String(media.season_number).padStart(2, "0")}E${String(media.episode_number).padStart(2, "0")}`
-    : null;
+const sxe = isEpisode ? episodeCode(media) : null;
 
 const progressPct =
   progress_percent != null ? Math.round(progress_percent * 100) : 0;
 
-const posterSrc = tmdbImageUrl(
+const posterSrc = ratingPosterUrl(tmdbImageUrl(
   isEpisode && media.show_poster_path ? media.show_poster_path : media.poster_path,
   "w500"
-);
+), media, Astro.locals.hasRpdbKey);
 
-const href =
-  isEpisode && !media.tvdb_sourced && media.show_tmdb_id && media.season_number != null && media.episode_number != null
-    ? `/show/${media.show_tmdb_id}/season/${media.season_number}/${media.episode_number}`
-    : isEpisode && media.show_tvdb_id && media.season_number != null && media.episode_number != null
-      ? `/show/tvdb/${media.show_tvdb_id}/season/${media.season_number}/${media.episode_number}`
-      : `/media/${media.type}/${media.tmdb_id}`;
+const href = episodeHref(media) ?? `/media/${media.type}/${media.tmdb_id}`;
 ---
 
 <div
@@ -49,12 +46,7 @@ const href =
             decoding="async"
           />
         ) : (
-          <div class="w-full h-full flex flex-col items-center justify-center text-zinc-700 bg-zinc-900 p-4 text-center">
-            <span class="text-3xl mb-2 opacity-30">🎬</span>
-            <span class="text-xs font-bold uppercase tracking-widest">
-              {media.title}
-            </span>
-          </div>
+          <PosterFallback kind={isEpisode ? "show" : "movie"} title={media.title} class="flex" />
         )
       }
 
@@ -108,7 +100,7 @@ const href =
   <button
     class="dismiss-cw absolute top-1.5 right-1.5 z-10 w-7 h-7 rounded-lg flex items-center justify-center bg-zinc-950/80 border border-zinc-800 text-zinc-500 hover:text-rose-200 hover:border-rose-700 hover:bg-rose-900 transition-all duration-200 cursor-pointer"
     data-media-id={item.media.id}
-    aria-label="Remove from continue watching"
+    aria-label={m.continue_watching_remove()}
   >
     <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>

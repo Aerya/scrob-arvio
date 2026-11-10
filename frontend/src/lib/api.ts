@@ -81,6 +81,21 @@ export interface CastMember {
   profile_path: string | null;
 }
 
+export interface CrewMember {
+  tmdb_id: number;
+  name: string;
+  job: string;
+  profile_path: string | null;
+}
+
+export interface TvdbCrewMember {
+  tmdb_id: null;
+  person_id: number | null;
+  name: string;
+  job: string;
+  profile_path: string | null;
+}
+
 export interface Network {
   id: number;
   name: string;
@@ -114,9 +129,15 @@ export interface SeasonState {
 }
 
 export interface EpisodeItem {
+  last_watched_at?: string | null;
   id: number | null;
-  tmdb_id: number;
+  // null for a TVDB-only episode (no TMDB counterpart); use `id` then.
+  tmdb_id: number | null;
+  tvdb_id?: number | null;
   episode_number: number;
+  season_number?: number;
+  canonical_season_number?: number;
+  canonical_episode_number?: number;
   title: string;
   overview: string | null;
   air_date: string | null;
@@ -147,6 +168,10 @@ export interface Season {
   tmdb_rating?: number | null;
   episodes: EpisodeItem[];
   season_number: number;
+  play_count: number;
+  watch_time_minutes: number;
+  last_watched_at?: string | null;
+  episode_order?: string;
   show_watched: boolean;
   season_watched: boolean;
   season_watch_pct: number;
@@ -169,9 +194,14 @@ export interface EpisodeDetail {
   air_date: string | null;
   episode_number: number;
   season_number: number;
+  episode_order?: string;
+  canonical_season_number?: number;
+  canonical_episode_number?: number;
   runtime: number | null;
   tmdb_rating: number | null;
-  tmdb_id: number;
+  // null for a TVDB-only episode (no TMDB counterpart); use `id` then.
+  tmdb_id: number | null;
+  tvdb_id?: number | null;
   id: number | null;
   in_library: boolean;
   watched: boolean;
@@ -179,9 +209,17 @@ export interface EpisodeDetail {
   collection_pct: number;
   user_rating?: number | null;
   play_count?: number;
+  watch_time_minutes?: number;
+  last_watched_at?: string | null;
   cast: CastMember[];
+  crew: CrewMember[];
   guest_stars: CastMember[];
   episodes: EpisodeItem[];
+  season?: {
+    name: string;
+    season_number: number;
+    poster_path: string | null;
+  };
   library: {
     resolution: string;
     video_codec: string;
@@ -228,6 +266,7 @@ export interface WatchEvent {
   watched_at: string | null;
   completed: boolean;
   progress_percent: number | null;
+  source?: string | null;
 }
 
 export interface SyncJob {
@@ -257,6 +296,9 @@ export interface UserList {
   name: string;
   description: string | null;
   privacy_level: PrivacyLevel;
+  // The user's native watchlist: every service's watchlist syncs with it,
+  // and it can't be deleted.
+  is_watchlist?: boolean;
   item_count: number;
   created_at: string;
   updated_at: string;
@@ -283,7 +325,7 @@ export interface ListDetail extends UserList {
 
 // Main types
 
-export type MediaType = "movie" | "series" | "episode" | "person" | "collection";
+export type MediaType = "movie" | "series" | "episode" | "person" | "collection" | "network" | "studio";
 
 export interface UserProfile {
   id: number;
@@ -294,6 +336,7 @@ export interface UserProfile {
   is_admin: boolean;
   api_key: string;
   totp_enabled: boolean;
+  has_password: boolean;
   created_at: string;
 }
 
@@ -304,10 +347,15 @@ export interface AdminUser {
   is_admin: boolean;
   api_key: string;
   created_at: string;
+  avatar_url: string | null;
+  totp_enabled?: boolean;
 }
 
 export interface GlobalSettings {
   tmdb_api_key: string | null;
+  mdblist_api_key: string | null;
+  tvdb_api_key: string | null;
+  tvdb_subscriber_pin: string | null;
   radarr_url: string | null;
   radarr_token: string | null;
   radarr_root_folder: string | null;
@@ -321,9 +369,11 @@ export interface GlobalSettings {
   sonarr_season_folder: boolean;
   radarr_require_approval: boolean;
   sonarr_require_approval: boolean;
+  default_episode_order: string | null;
   image_cache_enabled: boolean;
   image_cache_limit_gb: number | null;
-  allow_public_profiles: boolean;
+  enable_logged_out_navigation: boolean;
+  disable_comments: boolean;
 }
 
 export interface MediaRequestItem {
@@ -344,11 +394,27 @@ export interface LoginResponse {
   token_type: string;
   requires_2fa: boolean;
   temp_token: string | null;
+  expires_in?: number | null;
 }
 
 export interface TotpSetupData {
   provisioning_uri: string;
   secret: string;
+}
+
+export interface DevicePending {
+  client_name: string;
+  scope: string;
+  requested_at: string;
+}
+
+export interface DeviceGrant {
+  id: number;
+  client_name: string;
+  scope: string;
+  created_at: string;
+  approved_at: string | null;
+  last_seen_at: string | null;
 }
 
 export interface TotpBackupCode {
@@ -365,15 +431,29 @@ export interface OidcConfig {
   enabled: boolean;
   provider_name: string;
   disable_password_login: boolean;
+  sso_logout_available: boolean;
+  logout_url: string | null;
+  pkce_enabled: boolean;
+  id_token_validation: boolean;
 }
 
 export interface OidcAuthorizeResponse {
   auth_url: string;
   state: string;
+  code_verifier: string | null;
+  nonce: string | null;
+}
+
+export interface OidcIdentity {
+  issuer: string;
+  provider_name: string | null;
+  created_at: string;
+  last_login_at: string | null;
 }
 
 export interface OidcExchangeResponse {
   access_token: string;
+  expires_in?: number;
 }
 
 export type PrivacyLevel = "public" | "friends_only" | "private";
@@ -398,20 +478,26 @@ export interface UserSettings {
   has_global_tmdb_key: boolean;
 
   tvdb_api_key: string | null;
+  tvdb_subscriber_pin: string | null;
   has_effective_tvdb_key: boolean;
   has_global_tvdb_key: boolean;
+
+  rpdb_api_key: string | null;
+  has_rpdb_key: boolean;
 
   radarr_url: string | null;
   radarr_token: string | null;
   radarr_root_folder: string | null;
   radarr_quality_profile: number | null;
   radarr_tags: number[] | null;
+  has_effective_radarr: boolean;
 
   sonarr_url: string | null;
   sonarr_token: string | null;
   sonarr_root_folder: string | null;
   sonarr_quality_profile: number | null;
   sonarr_tags: number[] | null;
+  has_effective_sonarr: boolean;
 
   // Trakt
   trakt_connected: boolean;
@@ -423,20 +509,38 @@ export interface UserSettings {
   trakt_push_ratings: boolean;
   trakt_push_lists: boolean;
   trakt_scrobble: boolean;
+  trakt_show_comments: boolean;
 
   // Simkl
   simkl_client_id: string | null;
   simkl_connected: boolean;
+  simkl_auth_v1?: boolean;
   simkl_sync_watched: boolean;
   simkl_sync_ratings: boolean;
   simkl_sync_lists: boolean;
+  simkl_sync_dropped: boolean;
   simkl_push_watched: boolean;
   simkl_push_ratings: boolean;
+  simkl_push_dropped: boolean;
   simkl_scrobble: boolean;
+
+  // WeTrakr — no client_id field: Scrob ships a single app-owned key server-side
+  wetrakr_connected: boolean;
+  wetrakr_sync_watched: boolean;
+  wetrakr_sync_ratings: boolean;
+  wetrakr_push_watched: boolean;
+  wetrakr_push_ratings: boolean;
+  wetrakr_sync_lists: boolean;
+  wetrakr_push_lists: boolean;
+  wetrakr_sync_comments: boolean;
+  wetrakr_push_comments: boolean;
+  wetrakr_auto_sync_interval: number | null;
+  wetrakr_auto_push_interval: number | null;
 
   // MDBList
   mdblist_api_key: string | null;
   mdblist_connected: boolean;
+  has_global_mdblist_key: boolean;
   mdblist_sync_watched: boolean;
   mdblist_sync_ratings: boolean;
   mdblist_sync_watchlist: boolean;
@@ -447,9 +551,22 @@ export interface UserSettings {
   preferences: UserPreferences | null;
   blur_explicit: boolean;
   time_format_24h: boolean;
+  // Web UI language, one of the locales listed in project.inlang/settings.json;
+  // null = follow the browser.
+  ui_language: string | null;
   use_hls_player: boolean;
+  show_play_button: boolean;
   shuffle_next_up: boolean;
   minimalist_next_up: boolean;
+  next_up_by_recent_watch: boolean;
+  rate_prompt_movies: boolean;
+  rate_prompt_episodes: boolean;
+  duplicate_watch_window_minutes: number | null;
+  condense_history_by_show: boolean;
+  /** Order key, or null to inherit server_episode_order. */
+  default_episode_order: string | null;
+  /** What default_episode_order = null resolves to (admin-configured). */
+  server_episode_order: string;
 }
 
 export interface MediaServerConnection {
@@ -471,6 +588,8 @@ export interface MediaServerConnection {
   push_ratings: boolean;
   auto_sync_interval: number | null;
   auto_push_interval: number | null;
+  plex_sync_watchlist?: boolean;
+  plex_push_watchlist?: boolean;
   created_at: string;
 }
 
@@ -491,9 +610,45 @@ export interface MediaServerConnectionCreate {
   push_ratings?: boolean;
   auto_sync_interval?: number | null;
   auto_push_interval?: number | null;
+  plex_auth_token?: string | null;
+  plex_account_id?: string | null;
+  plex_machine_identifier?: string | null;
 }
 
 export type MediaServerConnectionUpdate = Partial<Omit<MediaServerConnectionCreate, "type">>;
+
+export interface PlexPinStart {
+  pin_id: number;
+  auth_url: string;
+  interval: number;
+}
+
+export interface PlexLoginConnection {
+  uri: string;
+  local: boolean;
+  relay: boolean;
+  protocol: string | null;
+  reachable: boolean;
+  label: string;
+}
+
+export interface PlexLoginServer {
+  name: string;
+  machine_identifier: string;
+  owned: boolean;
+  url: string;
+  token: string;
+  connections: PlexLoginConnection[];
+}
+
+export type PlexPinPoll =
+  | { status: "pending" }
+  | {
+      status: "connected";
+      account: { id: string; username: string; title: string; email: string };
+      auth_token: string;
+      servers: PlexLoginServer[];
+    };
 
 export interface ScrobbleConnection {
   id: number;
@@ -533,6 +688,7 @@ export interface ConnectionStatus {
   sonarr: ServiceStatus;
   trakt: ServiceStatus;
   simkl: ServiceStatus;
+  wetrakr: ServiceStatus;
   mdblist: ServiceStatus;
 }
 
@@ -553,24 +709,53 @@ export interface MediaItem {
   runtime?: number | null;
   genres?: string[];
   cast?: CastMember[];
+  crew?: CrewMember[];
   tagline?: string | null;
   status?: string | null;
   original_language?: string | null;
   age_rating?: string | null;
   imdb_id?: string | null;
   adult?: boolean;
+  // Movie-only (#319) - TMDB tags these via community-added keywords rather
+  // than a dedicated field, so they're derived server-side from the movie's
+  // keyword list.
+  has_mid_credits_scene?: boolean;
+  has_post_credits_scene?: boolean;
   show_id?: number | null;
   show_title?: string | null;
   show_tmdb_id?: number | null;
   show_tvdb_id?: number | null;
   show_poster_path?: string | null;
   show_backdrop_path?: string | null;
+  // The item's own provider ids besides tmdb_id. For an episode, tvdb_id is
+  // the TVDB *episode* id. A TVDB-only episode has tvdb_id and no tmdb_id;
+  // actions on it go through its local `id` (media_id) instead.
+  tvdb_id?: number | null;
+  imdb_id?: string | null;
   // True when this episode has no real TMDB counterpart and was enriched
   // from TVDB instead (see #101) — its season/episode numbers are TVDB's
   // raw numbers, not TMDB's, regardless of whether show_tmdb_id is set.
   tvdb_sourced?: boolean;
+  // The show's episode-ordering preference (#174) and, when it's a non-aired
+  // order, this item's position in that order - see lib/episodeHref.ts and
+  // lib/media-format.ts's episodeCode/displaySeasonEpisode, which card and
+  // link builders should go through rather than re-deriving.
+  show_episode_order?: string | null;
+  display_season_number?: number | null;
+  display_episode_number?: number | null;
   next_up_hidden?: boolean;
+  // Next Up remaining-content estimate (#170) — released unwatched episodes
+  // for the show and their estimated total runtime in minutes.
+  episodes_left?: number | null;
+  remaining_runtime?: number | null;
+  // Next Up only (#237) - the show's most recent watch (or, mid-rewatch, that
+  // rewatch's own progress/start time), for interleaving this feed with
+  // /continue-watching's own watched_at into one activity-sorted list.
+  last_watched_at?: string | null;
   known_for_department?: string | null;
+  // network / studio search results only
+  logo_path?: string | null;
+  origin_country?: string | null;
   in_library?: boolean;
   playable?: boolean;
   // Card action state
@@ -583,6 +768,7 @@ export interface MediaItem {
   request_enabled?: boolean;
   user_rating?: number | null;
   play_count?: number;
+  watch_time_minutes?: number;
   library: {
     resolution: string;
     video_codec: string;
@@ -633,6 +819,12 @@ export interface NowPlayingMedia {
   show_tmdb_id?: number;
   show_tvdb_id?: number | null;
   show_poster_path?: string | null;
+  tvdb_id?: number | null;
+  imdb_id?: string | null;
+  tvdb_sourced?: boolean;
+  show_episode_order?: string | null;
+  display_season_number?: number | null;
+  display_episode_number?: number | null;
 }
 
 export interface NowPlayingSession {
@@ -656,6 +848,39 @@ export interface ContinueWatchingItem {
   completed: boolean;
 }
 
+export interface DroppedShow {
+  id: number;
+  tmdb_id: number | null;
+  tvdb_id: number | null;
+  title: string;
+  poster_path: string | null;
+  year: string | null;
+  status: string | null;
+}
+
+export interface ShowProgress {
+  show_id: number;
+  tmdb_id: number | null;
+  tvdb_id: number | null;
+  title: string;
+  poster_path: string | null;
+  status: string | null;
+  episodes_total: number;
+  episodes_watched: number;
+  episodes_collected: number;
+  watch_pct: number;
+  collection_pct: number;
+  last_watched_at: string | null;
+}
+
+export interface DroppedMovie {
+  id: number;
+  tmdb_id: number | null;
+  title: string;
+  poster_path: string | null;
+  year: string | null;
+}
+
 export interface CollectionDetail {
   id: number;
   name: string;
@@ -667,7 +892,16 @@ export interface CollectionDetail {
   parts: MediaItem[];
 }
 
+export interface StudioHeader {
+  id: number;
+  name: string;
+  logo_path: string | null;
+  origin_country: string | null;
+  homepage: string | null;
+}
+
 export interface TvdbEpisode {
+  last_watched_at?: string | null;
   tvdb_id: number | null;
   tmdb_id: number | null;
   show_tmdb_id: number | null;
@@ -707,6 +941,8 @@ export interface TvdbEpisodeDetail {
   watched: boolean;
   user_rating: number | null;
   play_count: number;
+  watch_time_minutes: number;
+  last_watched_at?: string | null;
   in_lists: number[];
   library: {
     resolution: string | null;
@@ -717,6 +953,7 @@ export interface TvdbEpisodeDetail {
     subtitle_languages: string[] | null;
   } | null;
   cast: { tmdb_id: null; person_id: number | null; name: string; character: string; profile_path: string | null }[];
+  crew: TvdbCrewMember[];
   episodes: { episode_number: number; name: string | null }[];
   show: { id: number | null; tvdb_id: number; tmdb_id: number | null; episode_order: "tvdb"; title: string; poster_path: string | null; backdrop_path: string | null };
   season: { name: string; season_number: number; poster_path: string | null };
@@ -732,6 +969,9 @@ export interface TvdbSeason {
   backdrop_path: string | null;
   air_date: string | null;
   episodes: TvdbEpisode[];
+  play_count: number;
+  watch_time_minutes: number;
+  last_watched_at?: string | null;
   season_in_library: boolean;
   season_watch_pct: number;
   season_watch_started?: boolean;
@@ -789,30 +1029,46 @@ export interface TvdbShow {
   episode_order: "tvdb";
   genres: string[];
   network: string | null;
-  networks: { id: null; name: string; logo_path: null; origin_country: null }[];
+  // TMDB networks (id + logo) when the show has a TMDB counterpart; the
+  // name-only entries ({ id: null, logo_path: null }) are the TVDB fallback.
+  networks: { id: number | null; name: string; logo_path: string | null; origin_country: string | null }[];
   seasons: TvdbSeasonMeta[];
   seasons_meta: TvdbSeasonMeta[];
   cast: { tmdb_id: null; person_id: number | null; name: string; character: string; profile_path: string | null }[];
+  crew: TvdbCrewMember[];
   in_library: boolean;
   watched: boolean;
   watch_pct?: number;
   watch_started?: boolean;
+  dropped: boolean;
   in_lists: number[];
   collection_pct: number;
   is_monitored: boolean;
   request_enabled: boolean;
   request_status: string | null;
   user_rating: number | null;
+  play_count: number;
+  watch_time_minutes: number;
+  last_watched_at?: string | null;
   season_states: Record<number, SeasonState>;
   where_to_watch: { type: string; name: string; logo: string | null }[];
   rewatch?: ShowRewatch | null;
+}
+
+export interface EpisodeOrderOption {
+  key: string;
+  label: string;
+  provider: "tmdb" | "tvdb";
 }
 
 export interface Show {
   id: number | null;
   tmdb_id: number;
   tvdb_id?: number | null;
-  episode_order: "tmdb" | "tvdb";
+  // Order key: "tmdb:aired" (default), "tvdb:official", "tvdb:dvd",
+  // "tmdb:group:<id>", ... (#174). Legacy "tmdb"/"tvdb" no longer sent.
+  episode_order: string;
+  episode_order_label?: string | null;
   title: string;
   original_title: string | null;
   overview: string;
@@ -832,6 +1088,7 @@ export interface Show {
   seasons_meta: SeasonMeta[];
   season_states: Record<number, SeasonState>;
   cast: CastMember[];
+  crew: CrewMember[];
   networks: Network[];
   recommendations: MediaItem[];
   tagline: string | null;
@@ -841,6 +1098,9 @@ export interface Show {
   imdb_id?: string | null;
   adult?: boolean;
   user_rating?: number | null;
+  play_count?: number;
+  watch_time_minutes?: number;
+  last_watched_at?: string | null;
   first_air_date: string | null;
   last_air_date: string | null;
   where_to_watch?: { type: string; name: string; logo: string | null }[];
@@ -856,6 +1116,7 @@ export interface ProfileWatchedItem {
   watched_at: string;
   show_title: string | null;
   show_tmdb_id: number | null;
+  show_tvdb_id: number | null;
   show_poster_path: string | null;
   season_number: number | null;
   episode_number: number | null;
@@ -905,12 +1166,15 @@ export interface ProfileCommentItem {
   id: number;
   content: string;
   media_type: string;
-  tmdb_id: number;
+  tmdb_id: number | null;
+  tvdb_id: number | null;
   season_number: number | null;
   episode_number: number | null;
   title: string | null;
   poster_path: string | null;
   created_at: string;
+  wetrakr_comment_id?: number | null;
+  wetrakr_source?: string | null;
 }
 
 export interface PublicProfile {
@@ -971,6 +1235,60 @@ export interface Comment {
   is_spoiler: boolean;
   created_at: string;
   updated_at?: string | null;
+  wetrakr_comment_id?: number | null;
+  wetrakr_source?: string | null;
+}
+
+export interface TraktComment {
+  id: number;
+  comment: string;
+  spoiler: boolean;
+  review: boolean;
+  replies: number;
+  likes: number;
+  created_at: string;
+  user: {
+    username: string;
+    private: boolean;
+    name: string | null;
+    vip: boolean;
+    ids: { slug: string };
+  };
+}
+
+export interface TraktCommentsResponse {
+  enabled: boolean;
+  resolved: boolean;
+  comments: TraktComment[];
+  trakt_url?: string;
+}
+
+export interface CalendarEntry {
+  air_date: string;
+  show_tmdb_id?: number | null;
+  show_tvdb_id?: number | null;
+  show_title: string;
+  poster_path: string | null;
+  season_number: number | null;
+  episode_number: number | null;
+  episode_name: string | null;
+  collected: boolean;
+  watched: boolean;
+}
+
+export interface CalendarPayload {
+  schema?: number;
+  generated_at?: string;
+  today: string;
+  shows_checked?: number;
+  entries: CalendarEntry[];
+}
+
+export interface CalendarResponse {
+  sonarr_configured?: boolean;
+  computed_at: string | null;
+  cached: boolean;
+  calendar: CalendarPayload;
 }
 
 // API calls
@@ -990,8 +1308,14 @@ export const api = {
       post<{ message: string }>("/auth/forgot-password", { email }),
     resetPassword: (token: string, new_password: string) =>
       post<{ message: string }>(`/auth/reset-password/${token}`, { new_password }),
+    renewSession: (token: string) =>
+      post<{ access_token: string | null; expires_in: number | null }>("/auth/session/renew", undefined, token),
     me: (token: string) =>
       get<UserProfile>("/auth/me", undefined, token),
+    devicePending: (userCode: string, token: string) =>
+      get<DevicePending>("/auth/device/pending", { user_code: userCode }, token),
+    deviceGrants: (token: string) =>
+      get<DeviceGrant[]>("/auth/device/grants", undefined, token),
     getSettings: (token: string) =>
       get<UserSettings>("/auth/settings", undefined, token),
     updateSettings: (settings: Partial<UserSettings>, token: string) =>
@@ -1010,6 +1334,10 @@ export const api = {
       patch<MediaServerConnection>(`/auth/connections/${id}`, body, token),
     deleteConnection: (id: number, token: string) =>
       del<{ status: string }>(`/auth/connections/${id}`, token),
+    plexPinStart: (token: string) =>
+      post<PlexPinStart>("/auth/plex/pin/start", undefined, token),
+    plexPinPoll: (token: string) =>
+      post<PlexPinPoll>("/auth/plex/pin/poll", undefined, token),
     startStremioLink: (token: string) =>
       post<{ code: string; link: string; qrcode: string }>("/auth/stremio/link/start", undefined, token),
     pollStremioLink: (body: { code: string; name: string }, token: string) =>
@@ -1054,8 +1382,12 @@ export const api = {
       get<OidcConfig>("/auth/oidc/config"),
     oidcAuthorize: () =>
       get<OidcAuthorizeResponse>("/auth/oidc/authorize"),
-    oidcExchange: (code: string) =>
-      post<OidcExchangeResponse>("/auth/oidc/exchange", { code }),
+    oidcExchange: (body: { code: string; code_verifier?: string; nonce?: string; remember?: boolean }) =>
+      post<OidcExchangeResponse>("/auth/oidc/exchange", body),
+    oidcIdentities: (token: string) =>
+      get<OidcIdentity[]>("/auth/oidc/identities", undefined, token),
+    oidcUnlink: (body: { issuer: string }, token: string) =>
+      post<{ status: string }>("/auth/oidc/unlink", body, token),
   },
 
   trakt: {
@@ -1090,7 +1422,7 @@ export const api = {
   },
 
   media: {
-    list: (params?: { type?: string; sort?: string; page?: number; genre?: string[]; year?: number[]; watched?: string[] }, token?: string) =>
+    list: (params?: { type?: string; sort?: string; page?: number; genre?: string[]; year?: number[]; watched?: string[]; in_list?: string; my_rating?: number[] }, token?: string) =>
       get<{ page: number; page_size: number; total_pages: number; total_results: number; results: MediaItem[] }>("/media", params, token),
 
     years: (type: string, token?: string) =>
@@ -1119,7 +1451,13 @@ export const api = {
     getCollection: (collectionId: number, token?: string) =>
       get<CollectionDetail>(`/media/collection/${collectionId}`, undefined, token),
 
-    tmdbList: (params: { type: string; category?: string; page?: number; genre?: string; year?: number; min_rating?: number; status?: string }, token?: string) =>
+    getNetwork: (networkId: number, token?: string) =>
+      get<StudioHeader>(`/media/network/${networkId}`, undefined, token),
+
+    getCompany: (companyId: number, token?: string) =>
+      get<StudioHeader>(`/media/company/${companyId}`, undefined, token),
+
+    tmdbList: (params: { type: string; category?: string; page?: number; genre?: string[]; exclude_genre?: string[]; year?: number[]; min_rating?: number; status?: string; collection?: string[]; watch?: string[]; arr?: string[]; my_rating?: number[]; original_language?: string; exclude_language?: string[]; in_list?: string[]; network?: number; company?: number }, token?: string) =>
       get<{ results: MediaItem[]; page: number; total_pages: number; total_results: number }>("/media/tmdb/list", params, token),
 
     search: (q: string, type?: string, page: number = 1, year?: number, token?: string, inLibrary?: boolean) =>
@@ -1136,6 +1474,9 @@ export const api = {
 
     airingTodayCollected: (token?: string) =>
       get<{ results: MediaItem[] }>("/media/airing-today/collected", {}, token),
+
+    publicPosterWall: () =>
+      get<{ posters: { poster_path: string; title: string | null; media_type: "movie" | "series" }[] }>("/media/public/poster-wall"),
 
     trendingMovies: (page: number = 1, token?: string) =>
       get<{ results: MediaItem[]; page: number; total_pages: number; total_results: number }>("/media/trending/movies", { page }, token),
@@ -1178,12 +1519,14 @@ export const api = {
   },
 
   shows: {
-    list: (params?: { sort?: string; page?: number; page_size?: number; genre?: string[]; year?: number[]; status?: string[]; watched?: string[] }, token?: string) =>
+    list: (params?: { sort?: string; page?: number; page_size?: number; genre?: string[]; year?: number[]; status?: string[]; watched?: string[]; in_list?: string; my_rating?: number[] }, token?: string) =>
       get<{ page: number; page_size: number; total_results: number; total_pages: number; results: any[] }>("/shows", params, token),
 
     years: (token?: string) =>
       get<{ years: number[] }>("/shows/years", undefined, token),
 
+    // The active episode ordering is the user's stored per-show preference,
+    // resolved server-side (#174) - no query param needed.
     get: (seriesTmdbId: number, token?: string) =>
       get<Show>(`/shows/${seriesTmdbId}`, undefined, token),
 
@@ -1199,18 +1542,42 @@ export const api = {
     refreshMetadata: (seriesTmdbId: number, token: string) =>
       post<{ message: string }>(`/shows/${seriesTmdbId}/refresh`, undefined, token),
 
-    setEpisodeOrder: (seriesTmdbId: number, episodeOrder: "tmdb" | "tvdb", token: string, forceRefresh = false) =>
+    getEpisodeOrders: (seriesTmdbId: number, token?: string) =>
+      get<{ orders: EpisodeOrderOption[]; selected: string }>(
+        `/shows/${seriesTmdbId}/episode-orders`, undefined, token,
+      ),
+
+    setEpisodeOrder: (
+      seriesTmdbId: number, orderKey: string, token: string,
+      opts?: { label?: string | null; forceRefresh?: boolean },
+    ) =>
       post<{
-        episode_order: "tmdb" | "tvdb";
-        series_tmdb_id: number;
-        tvdb_id: number | null;
-        redirect: string;
-        mapping: { matched: number; tmdb_episodes: number; unmatched: number } | null;
+        status?: "started";
+        job_id?: number;
+        episode_order?: string;
+        series_tmdb_id?: number;
+        redirect?: string;
       }>(
         `/shows/${seriesTmdbId}/episode-order`,
-        { episode_order: episodeOrder, force_refresh: forceRefresh },
+        { episode_order: orderKey, order_label: opts?.label ?? null, force_refresh: opts?.forceRefresh ?? false },
         token,
       ),
+
+    applyDefaultEpisodeOrder: (episodeOrder: "tmdb" | "tvdb", token: string) =>
+      post<{
+        status: "started" | "noop";
+        job_id?: number;
+        shows: number;
+        episode_order: "tmdb" | "tvdb";
+      }>(`/shows/episode-order/apply-default`, { order: episodeOrder }, token),
+
+    getEpisodeOrderJob: (jobId: number, token: string) =>
+      get<{
+        status: string;
+        total_items: number | null;
+        processed_items: number | null;
+        stats: { episode_order?: string; switched?: number; failed?: number } | null;
+      }>(`/shows/episode-order/jobs/${jobId}`, undefined, token),
 
     getTvdb: (tvdbId: number, token?: string) =>
       get<TvdbShow>(`/shows/tvdb/${tvdbId}`, undefined, token),
@@ -1223,7 +1590,7 @@ export const api = {
   },
 
   history: {
-    list: (params?: { page?: number; page_size?: number; type?: string }, token?: string) =>
+    list: (params?: { page?: number; page_size?: number; type?: string; q?: string }, token?: string) =>
       get<{ page: number; page_size: number; total_pages: number; total_results: number; results: WatchEvent[] }>("/history", params, token),
 
     markAsWatched: (body: { tmdb_id: number; media_type: string; watched_at?: string | null; completed?: boolean }, token: string) =>
@@ -1258,12 +1625,23 @@ export const api = {
 
     nowPlaying: (token: string) =>
       get<{ now_playing: NowPlayingSession[] }>("/history/now-playing", undefined, token),
+
+    dropped: (token?: string) =>
+      get<{ shows: DroppedShow[]; movies: DroppedMovie[] }>("/history/dropped", undefined, token),
+
+    progress: (
+      params: { type?: "watched" | "collection"; sort?: string; hide_complete?: boolean; page?: number },
+      token?: string,
+    ) =>
+      get<{ shows: ShowProgress[]; page: number; page_size: number; total: number; total_pages: number }>(
+        "/history/progress", params, token,
+      ),
   },
 
   lists: {
     getAll: (token: string) =>
       get<{ lists: UserList[] }>("/lists", undefined, token),
-    getPublic: (token: string) =>
+    getPublic: (token?: string) =>
       get<{ lists: PublicList[] }>("/lists/public", undefined, token),
     create: (body: { name: string; description?: string; privacy_level?: PrivacyLevel }, token: string) =>
       post<UserList>("/lists", body, token),
@@ -1308,7 +1686,7 @@ export const api = {
     getPublic: (userId: number, token?: string) =>
       get<PublicProfile>(`/profile/${userId}`, undefined, token),
     publicAccessStatus: () =>
-      get<{ allow_public_profiles: boolean }>("/profile/public-access-status"),
+      get<{ enable_logged_out_navigation: boolean; disable_comments: boolean; has_global_tvdb_key: boolean }>("/profile/public-access-status"),
     update: (body: Partial<UserPreferences>, token: string) =>
       patch<UserPreferences>("/profile/me", body, token),
     uploadAvatar: (formData: FormData, token: string) =>
@@ -1323,17 +1701,37 @@ export const api = {
       get<{ results: UserSearchResult[] }>("/profile/search", { q }, token),
     getStats: (userId: number, token?: string) =>
       get<UserStats>(`/profile/${userId}/stats`, undefined, token),
+    topRatedMovies: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileRatedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/top-rated-movies`, { page }, token),
+    topRatedShows: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileRatedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/top-rated-shows`, { page }, token),
+    recentlyWatchedMovies: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileWatchedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/recently-watched-movies`, { page }, token),
+    recentlyWatchedShows: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileWatchedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/recently-watched-shows`, { page }, token),
   },
 
   comments: {
-    list: (params: { media_type: string; tmdb_id: number; season_number?: number; episode_number?: number }, token?: string) =>
+    list: (params: { media_type: string; tmdb_id?: number; tvdb_id?: number; season_number?: number; episode_number?: number }, token?: string) =>
       get<Comment[]>("/comments", params, token),
-    create: (body: { media_type: string; tmdb_id: number; season_number?: number; episode_number?: number; content: string }, token: string) =>
+    create: (body: { media_type: string; tmdb_id?: number; tvdb_id?: number; season_number?: number; episode_number?: number; content: string }, token: string) =>
       post<Comment>("/comments", body, token),
     update: (id: number, content: string, token: string) =>
       patch<{ id: number; content: string; updated_at: string | null }>(`/comments/${id}`, { content }, token),
     delete: (id: number, token: string) =>
       del<{ message: string }>(`/comments/${id}`, token),
+  },
+
+  traktComments: {
+    list: (params: { media_type: "movie" | "show"; tmdb_id?: number; tvdb_id?: number; season_number?: number; episode_number?: number }, token?: string) =>
+      get<TraktCommentsResponse>("/trakt/comments", params, token),
+  },
+
+  calendar: {
+    get: (token?: string, cachedOnly?: boolean, days?: number, sonarrOnly?: boolean, sonarrMonitored?: boolean) =>
+      get<CalendarResponse>("/calendar", { ...(cachedOnly ? { cached_only: true } : {}), ...(days ? { days } : {}), ...(sonarrOnly ? { sonarr_only: true } : {}), ...(sonarrMonitored ? { sonarr_monitored: true } : {}) }, token),
+    refresh: (token?: string) =>
+      post<CalendarResponse>("/calendar/refresh", undefined, token),
   },
 
   admin: {
@@ -1358,13 +1756,17 @@ export const api = {
   },
 };
 
+// Route TMDB and TheTVDB images through the backend image proxy (which serves
+// a locally cached copy when the admin has enabled the image cache, or 302s to
+// the origin otherwise). TheTVDB artwork has no size variants, so it uses the
+// synthetic "tvdb" size bucket.
 export function tmdbImageUrl(path: string | null | undefined, size: string = "w500"): string | null {
   if (!path) return null;
   if (path.startsWith("http://") || path.startsWith("https://")) {
-    const match = /image\.tmdb\.org\/t\/p\/([^/]+)(\/.+)$/.exec(path);
-    if (match) {
-      return `/api/proxy/media/image/${match[1]}${match[2]}`;
-    }
+    const tmdb = /image\.tmdb\.org\/t\/p\/([^/]+)(\/.+)$/.exec(path);
+    if (tmdb) return `/api/proxy/media/image/${tmdb[1]}${tmdb[2]}`;
+    const tvdb = /artworks\.thetvdb\.com(\/.+)$/.exec(path);
+    if (tvdb) return `/api/proxy/media/image/tvdb${tvdb[1]}`;
     return path;
   }
   const cleanPath = path.startsWith("/") ? path : `/${path}`;

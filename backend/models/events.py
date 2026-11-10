@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, func, Index
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -18,6 +18,15 @@ class WatchEvent(Base):
     user_id          : Mapped[int]             = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     media_id         : Mapped[int]             = mapped_column(ForeignKey("media.id", ondelete="CASCADE"), nullable=False)
     watched_at       : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # When this row was inserted - distinct from watched_at, which is when the
+    # user says they watched it (possibly long ago, possibly unknown/NULL).
+    # Needed to bound the webhook duplicate-delivery guard for an unknown-dated
+    # event (see routers/webhooks.py:_write_watch_event and GitHub #355) -
+    # without it, that guard has no way to tell "this null-dated row was just
+    # inserted a second ago" from "this null-dated row is three years old",
+    # and treating every null-dated event as a permanent duplicate marker
+    # silently blocks all future real rewatches of that title.
+    created_at       : Mapped[datetime]        = mapped_column(DateTime, server_default=func.now(), nullable=False)
     progress_seconds : Mapped[Optional[int]]   = mapped_column(Integer)
     progress_percent : Mapped[Optional[float]] = mapped_column(Float)
     completed        : Mapped[bool]            = mapped_column(Boolean, default=False, nullable=False)
@@ -29,6 +38,14 @@ class WatchEvent(Base):
     # these instead of exact-matching against it and creating a duplicate
     # (see GitHub #135).
     provisional      : Mapped[bool]            = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    # Set when the row was pulled from a cloud service ("wetrakr"), so that service's
+    # push never sends the play straight back to where it came from.
+    origin           : Mapped[Optional[str]]   = mapped_column(String(16), nullable=True)
+    # Where this play was recorded from (plex, jellyfin, emby, kodi, trakt,
+    # manual, ...), shown in the history view (#477). NULL for rows written
+    # before it was tracked. Unlike origin, which only exists to stop a cloud
+    # service's push echoing a play back to it, this is purely informational.
+    source           : Mapped[Optional[str]]   = mapped_column(String(16), nullable=True)
 
     user  : Mapped["User"]  = relationship(back_populates="watch_events")
     media : Mapped["Media"] = relationship(back_populates="watch_events")

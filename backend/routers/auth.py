@@ -2,34 +2,46 @@ import secrets
 import pyotp
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import delete, func
+from sqlalchemy import delete, func, or_, and_
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from jose import jwt, JWTError
+import jwt
+from jwt import PyJWTError
 
 from db import get_db
+from models.base import UserRole
 from models.users import User, UserSettings, TotpBackupCode
 from models.global_settings import GlobalSettings
 from models.connections import MediaServerConnection
 from models.scrobble_connection import ScrobbleConnection
 from models.email_activation import EmailActivation
 from models.password_reset import PasswordResetToken
-from core.security import verify_password, get_password_hash, create_access_token, ALGORITHM
+from models.oauth_device import OAuthDeviceGrant
+from core.security import (
+    verify_password,
+    get_password_hash,
+    create_access_token,
+    session_lifetime,
+    hash_opaque_token,
+    generate_opaque_token,
+    ALGORITHM,
+)
 from core.config import settings as app_settings
-from core.email import send_activation_email, send_password_reset_email
+from core.email import send_activation_email, send_email_change_email, send_password_reset_email
 from core.url_validator import validate_service_url
 from core.limiter import limiter
 from core.backup import restore_backup
 from core.nuvio import NuvioAPIError, parse_profile_id
 import schemas
-from dependencies import get_current_user
+from dependencies import get_current_user, oauth2_scheme, DEVICE_TOKEN_TYPE
 from sqlalchemy.orm import selectinload
 from fastapi import File, UploadFile
+from core.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +166,19 @@ async def reset_password(
     return {"message": "Password updated successfully."}
 
 
+async def _find_user_for_login(db: AsyncSession, typed: str) -> User | None:
+    """Resolve the username typed on the login form (#427). Surrounding spaces
+    (mobile keyboard autocomplete) are ignored and case doesn't matter, unless
+    two accounts differ only by case - an exact match always wins, and an
+    ambiguous case-insensitive match finds nobody rather than guessing."""
+    typed = typed.strip()
+    exact = (await db.execute(select(User).where(User.username == typed))).scalar_one_or_none()
+    if exact:
+        return exact
+    loose = (await db.execute(select(User).where(func.lower(User.username) == typed.lower()).limit(2))).scalars().all()
+    return loose[0] if len(loose) == 1 else None
+
+
 @router.post("/register", response_model=schemas.User)
 @limiter.limit("10/minute")
 async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
@@ -163,7 +188,9 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
             detail="Registrations are disabled.",
         )
 
-    query = select(User).where((User.email == user_in.email) | (User.username == user_in.username))
+    query = select(User).where(
+        (User.email == user_in.email) | (func.lower(User.username) == user_in.username.strip().lower())
+    )
     result = await db.execute(query)
     if result.scalar_one_or_none():
         raise HTTPException(
@@ -177,10 +204,15 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
     email_confirmed = not app_settings.require_email_validation
     new_user = User(
         email=user_in.email,
-        username=user_in.username,
+        username=user_in.username.strip(),
         password_hash=get_password_hash(user_in.password),
         api_key=_generate_api_key(),
-        role=user_in.role,
+        # Never take the role from the request body: role == "admin" grants
+        # elevated access in several routers independently of is_admin, so a
+        # self-registering user could escalate by posting {"role": "admin"}.
+        # The first user is the bootstrap admin, so it gets both is_admin and
+        # the admin role (some routers check role, others is_admin).
+        role=UserRole.admin if is_first_user else UserRole.user,
         is_admin=is_first_user,
         email_confirmed=email_confirmed,
     )
@@ -203,18 +235,27 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
 
     return new_user
 
+def _session_claims(remember: bool) -> Optional[dict]:
+    """Extra claims on a user login token. `rem` records "Stay logged in" so
+    a renewed token keeps the same lifetime as the one it replaces."""
+    return {"rem": True} if remember else None
+
+
 @router.post("/login", response_model=schemas.Token)
 @limiter.limit("10/minute")
-async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    remember: bool = Form(False),
+    db: AsyncSession = Depends(get_db),
+):
     if app_settings.oidc_enabled and app_settings.oidc_disable_password_login:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Password login is disabled. Please use SSO.",
         )
 
-    query = select(User).where(User.username == form_data.username)
-    result = await db.execute(query)
-    user = result.scalar_one_or_none()
+    user = await _find_user_for_login(db, form_data.username)
 
     if not user or not user.password_hash or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
@@ -233,12 +274,35 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
         temp_token = create_access_token(
             subject=user.id,
             expires_delta=timedelta(minutes=10),
-            extra_claims={"type": "2fa_pending"},
+            extra_claims={"type": "2fa_pending", "remember": remember},
         )
         return {"requires_2fa": True, "temp_token": temp_token}
 
-    access_token = create_access_token(subject=user.id)
-    return {"access_token": access_token, "token_type": "bearer"}
+    lifetime = session_lifetime(remember)
+    access_token = create_access_token(
+        subject=user.id, expires_delta=lifetime, extra_claims=_session_claims(remember)
+    )
+    return {"access_token": access_token, "token_type": "bearer", "expires_in": int(lifetime.total_seconds())}
+
+async def _email_in_use(db: AsyncSession, email: str, exclude_user_id: int) -> bool:
+    result = await db.execute(
+        select(User.id).where(func.lower(User.email) == email.lower(), User.id != exclude_user_id)
+    )
+    return result.first() is not None
+
+
+async def _apply_activation(db: AsyncSession, user: User, activation: EmailActivation) -> bool:
+    """Confirms the user's email via a clicked activation link. A link for a
+    different address than the one on file is a pending email change (#471):
+    the address switches only now, once the new inbox is proven. Returns False
+    when that address got taken by someone else in the meantime."""
+    if activation.email.lower() != user.email.lower():
+        if await _email_in_use(db, activation.email, user.id):
+            return False
+        user.email = activation.email
+    user.email_confirmed = True
+    return True
+
 
 @router.get("/activate/{token}", include_in_schema=False)
 async def activate_email(token: str, db: AsyncSession = Depends(get_db)):
@@ -257,11 +321,14 @@ async def activate_email(token: str, db: AsyncSession = Depends(get_db)):
 
     user_result = await db.execute(select(User).where(User.id == activation.user_id))
     user = user_result.scalar_one_or_none()
+    taken = False
     if user:
-        user.email_confirmed = True
+        taken = not await _apply_activation(db, user, activation)
     await db.delete(activation)
     await db.commit()
 
+    if taken:
+        return RedirectResponse(f"{frontend}/auth/activate/{token}?error=taken")
     return RedirectResponse(f"{frontend}/auth/activate/{token}?success=true")
 
 
@@ -282,11 +349,14 @@ async def activate_email_api(token: str, db: AsyncSession = Depends(get_db)):
 
     user_result = await db.execute(select(User).where(User.id == activation.user_id))
     user = user_result.scalar_one_or_none()
+    taken = False
     if user:
-        user.email_confirmed = True
+        taken = not await _apply_activation(db, user, activation)
     await db.delete(activation)
     await db.commit()
 
+    if taken:
+        raise HTTPException(status_code=400, detail="taken")
     return {"success": True}
 
 
@@ -322,6 +392,38 @@ async def bootstrap_restore(
     return {"status": "restored"}
 
 
+# Re-issue a login token with a fresh expiry (sliding session). The frontend
+# calls this on page loads so an active user is never logged out, while an idle
+# one still expires after the normal 7 days (or SESSION_REMEMBER_DAYS).
+SESSION_RENEW_MIN_AGE_SECONDS = 5 * 60
+
+
+@router.post("/session/renew")
+async def renew_session(
+    token: str = Depends(oauth2_scheme),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        payload = jwt.decode(token, app_settings.secret_key, algorithms=[ALGORITHM])
+    except PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
+    # Only plain login tokens slide; typed ones (device grants, 2FA) never do.
+    if payload.get("type"):
+        return {"access_token": None, "expires_in": None}
+
+    remember = bool(payload.get("rem"))
+    lifetime = session_lifetime(remember)
+    remaining = float(payload.get("exp", 0)) - datetime.now(timezone.utc).timestamp()
+    if remaining > lifetime.total_seconds() - SESSION_RENEW_MIN_AGE_SECONDS:
+        # Issued moments ago, nothing to gain from minting another.
+        return {"access_token": None, "expires_in": int(remaining)}
+
+    new_token = create_access_token(
+        subject=current_user.id, expires_delta=lifetime, extra_claims=_session_claims(remember)
+    )
+    return {"access_token": new_token, "expires_in": int(lifetime.total_seconds())}
+
+
 @router.get("/me", response_model=schemas.User)
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
@@ -351,14 +453,32 @@ async def _settings_response(settings: UserSettings, db: AsyncSession) -> schema
     data = schemas.UserSettings.model_validate(settings)
     data.trakt_connected = bool(settings.trakt_access_token)
     data.simkl_connected = bool(settings.simkl_access_token)
+    data.simkl_auth_v1 = bool(settings.simkl_access_token and not settings.simkl_refresh_token)
+    data.wetrakr_connected = bool(settings.wetrakr_access_token)
     data.mdblist_connected = bool(settings.mdblist_api_key)
     data.bingebase_connected = bool(settings.bingebase_webhook_url or settings.bingebase_api_key)
     gs_result = await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))
     gs = gs_result.scalar_one_or_none()
+    data.has_rpdb_key = bool(settings.rpdb_api_key)
     data.has_global_tmdb_key = bool(gs and gs.tmdb_api_key)
     data.has_effective_tmdb_key = bool(settings.tmdb_api_key) or data.has_global_tmdb_key
     data.has_global_tvdb_key = bool(gs and gs.tvdb_api_key)
     data.has_effective_tvdb_key = bool(settings.tvdb_api_key) or data.has_global_tvdb_key
+    data.has_global_mdblist_key = bool(gs and getattr(gs, "mdblist_api_key", None))
+    # What default_episode_order = NULL resolves to, so the settings page can
+    # label its "server default" option with the order it actually inherits.
+    data.server_episode_order = (gs.default_episode_order if gs else None) or "tmdb"
+    # Same "all 4 fields set, user config first" rule as _effective_radarr/
+    # _effective_sonarr in routers/media.py - inlined rather than imported to
+    # avoid a routers.media <-> routers.auth cross-import.
+    data.has_effective_radarr = bool(
+        all([settings.radarr_url, settings.radarr_token, settings.radarr_root_folder, settings.radarr_quality_profile])
+        or (gs and all([gs.radarr_url, gs.radarr_token, gs.radarr_root_folder, gs.radarr_quality_profile]))
+    )
+    data.has_effective_sonarr = bool(
+        all([settings.sonarr_url, settings.sonarr_token, settings.sonarr_root_folder, settings.sonarr_quality_profile])
+        or (gs and all([gs.sonarr_url, gs.sonarr_token, gs.sonarr_root_folder, gs.sonarr_quality_profile]))
+    )
     return data
 
 
@@ -397,29 +517,75 @@ async def update_user_settings(
         db.add(settings)
 
     # Computed read-only fields; never write them back
-    READ_ONLY_FIELDS = {"trakt_connected", "simkl_connected", "mdblist_connected", "bingebase_connected", "has_global_tmdb_key", "has_effective_tmdb_key", "has_global_tvdb_key", "has_effective_tvdb_key"}
+    READ_ONLY_FIELDS = {"trakt_connected", "simkl_connected", "simkl_auth_v1", "wetrakr_connected", "mdblist_connected", "bingebase_connected", "has_rpdb_key", "has_global_tmdb_key", "has_effective_tmdb_key", "has_global_tvdb_key", "has_effective_tvdb_key", "has_global_mdblist_key", "server_episode_order"}
     update_data = {k: v for k, v in settings_in.model_dump(exclude_unset=True).items() if k not in READ_ONLY_FIELDS}
+
+    new_rpdb_key = update_data.get("rpdb_api_key")
+    if new_rpdb_key and new_rpdb_key != settings.rpdb_api_key:
+        from core import rpdb
+        if not await rpdb.validate_api_key(new_rpdb_key):
+            raise HTTPException(status_code=400, detail="RPDB could not validate this API key. Check the key and try again.")
 
     if "tmdb_api_key" in update_data and update_data["tmdb_api_key"]:
         success = await tmdb.validate_api_key(update_data["tmdb_api_key"])
         if not success:
             raise HTTPException(status_code=400, detail="Invalid TMDB API Key")
 
-    if "tvdb_api_key" in update_data and update_data["tvdb_api_key"]:
+    # Validate the resulting TVDB key/PIN pair whenever either is touched - but
+    # not when the key is being cleared (nothing to validate then).
+    tvdb_touched = "tvdb_api_key" in update_data or "tvdb_subscriber_pin" in update_data
+    new_tvdb_key = update_data["tvdb_api_key"] if "tvdb_api_key" in update_data else settings.tvdb_api_key
+    new_tvdb_pin = update_data["tvdb_subscriber_pin"] if "tvdb_subscriber_pin" in update_data else settings.tvdb_subscriber_pin
+    if tvdb_touched and new_tvdb_key:
         from core import tvdb
-        success = await tvdb.validate_api_key(update_data["tvdb_api_key"])
-        if not success:
-            raise HTTPException(status_code=400, detail="Invalid TVDB API Key")
+        if not await tvdb.validate_api_key(new_tvdb_key, pin=new_tvdb_pin or None):
+            raise HTTPException(
+                status_code=400,
+                detail="TVDB rejected the key" + (" / PIN" if new_tvdb_pin else "")
+                + ". A subscriber-supported key needs its account PIN; a free project key needs no PIN.",
+            )
+
+    # Stored normalised, so every reader can compare order keys rather than
+    # the legacy "tmdb"/"tvdb" spellings. A TVDB order needs a TVDB key, same
+    # requirement as the per-show switch in routers/shows.py.
+    if update_data.get("default_episode_order"):
+        from core.episode_order import validate_default_episode_order
+
+        try:
+            order_key = validate_default_episode_order(update_data["default_episode_order"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        update_data["default_episode_order"] = order_key
+        if order_key.startswith("tvdb:"):
+            from routers.shows import get_user_tvdb_key
+
+            if not await get_user_tvdb_key(db, current_user.id):
+                raise HTTPException(status_code=400, detail="TVDB API key not configured")
 
     if "mdblist_api_key" in update_data and update_data["mdblist_api_key"]:
         from core import mdblist
         if not await mdblist.validate_api_key(update_data["mdblist_api_key"]):
             raise HTTPException(status_code=400, detail="Invalid MDBList API key")
 
-    url_fields = {"radarr_url": "Radarr URL", "sonarr_url": "Sonarr URL"}
+    url_fields = {"radarr_url": "Radarr URL", "sonarr_url": "Sonarr URL", "bingebase_webhook_url": "Bingebase Webhook URL"}
     for field, label in url_fields.items():
         if field in update_data and update_data[field]:
             update_data[field] = await validate_service_url(update_data[field], label)
+
+    # Turning a WeTrakr push flag on needs one full push of the existing
+    # history, so drop the incremental bookmark.
+    if any(update_data.get(f) and not getattr(settings, f) for f in ("wetrakr_push_watched", "wetrakr_push_ratings")):
+        settings.wetrakr_last_push_at = None
+    if update_data.get("wetrakr_push_lists") and not settings.wetrakr_push_lists:
+        settings.wetrakr_last_lists_push_at = None
+    # Likewise a pull option turned on later has never been read: without
+    # dropping the stamp, the incremental pull would only ever see changes
+    # made from now on and skip the existing data.
+    if any(
+        update_data.get(f) and not getattr(settings, f)
+        for f in ("wetrakr_sync_watched", "wetrakr_sync_ratings", "wetrakr_sync_lists", "wetrakr_sync_comments")
+    ):
+        settings.wetrakr_last_activity = None
 
     for field, value in update_data.items():
         if hasattr(settings, field):
@@ -508,6 +674,24 @@ async def create_connection(
         server_user_id = profile_id
         server_username = arvio.get_profile_name(profiles, profile_id)
 
+    plex_auth_token = None
+    plex_account_id = None
+    plex_machine_identifier = None
+    if body.type == "plex":
+        plex_auth_token = body.plex_auth_token or None
+        plex_account_id = body.plex_account_id or None
+        plex_machine_identifier = body.plex_machine_identifier or None
+        if plex_machine_identifier:
+            dup = await db.execute(
+                select(MediaServerConnection).where(
+                    MediaServerConnection.user_id == current_user.id,
+                    MediaServerConnection.type == "plex",
+                    MediaServerConnection.plex_machine_identifier == plex_machine_identifier,
+                )
+            )
+            if dup.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="This Plex server is already connected.")
+
     cloud_media_provider = body.type in ("nuvio", "stremio", "arvio")
     conn = MediaServerConnection(
         user_id=current_user.id,
@@ -517,13 +701,17 @@ async def create_connection(
         token=connection_token,
         server_user_id=server_user_id,
         server_username=server_username,
+        plex_auth_token=plex_auth_token,
+        plex_account_id=plex_account_id,
+        plex_machine_identifier=plex_machine_identifier,
         sync_collection=body.sync_collection,
         sync_watched=body.sync_watched,
         sync_ratings=body.sync_ratings if not cloud_media_provider else False,
         sync_playback=body.sync_playback,
         push_watched=body.push_watched,
         push_collection=body.push_collection if cloud_media_provider else False,
-        push_playback=body.push_playback if cloud_media_provider else False,
+        # Plex takes resume points too (core/plex_progress.py).
+        push_playback=body.push_playback if cloud_media_provider or body.type == "plex" else False,
         push_ratings=body.push_ratings if not cloud_media_provider else False,
         auto_sync_interval=body.auto_sync_interval,
         auto_push_interval=body.auto_push_interval,
@@ -581,7 +769,6 @@ async def update_connection(
             from core import nuvio
 
             candidate_url = update_data.get("url", conn.url)
-            candidate_token = update_data.get("token", conn.token)
             profile_id = _parse_nuvio_profile_id(update_data.get("server_user_id", conn.server_user_id))
 
             async def _persist_refresh(session: nuvio.NuvioSession) -> None:
@@ -593,6 +780,15 @@ async def update_connection(
 
             try:
                 async with nuvio.connection_lock(conn.id):
+                    # Refresh_token is single-use and rotates on every redeem
+                    # (see core/nuvio.py's connection_lock docstring) - conn
+                    # may have been loaded before another request (e.g. the
+                    # connections page's status check) already rotated it
+                    # while this one waited for the lock. Re-read the latest
+                    # persisted value now, inside the lock, rather than reuse
+                    # whatever was loaded at request start.
+                    await db.refresh(conn)
+                    candidate_token = update_data.get("token", conn.token)
                     session, profiles = await nuvio.validate_connection(
                         candidate_url, candidate_token, profile_id, on_refresh=_persist_refresh
                     )
@@ -606,8 +802,18 @@ async def update_connection(
             update_data["push_playback"] = update_data.get("push_playback", conn.push_playback)
             update_data["push_collection"] = update_data.get("push_collection", conn.push_collection)
         else:
-            update_data["push_playback"] = False
+            if conn.type == "plex":
+                update_data["push_playback"] = update_data.get("push_playback", conn.push_playback)
+            else:
+                update_data["push_playback"] = False
             update_data["push_collection"] = False
+
+    # Re-enabling a watchlist sync direction starts from a clean bootstrap: a
+    # baseline recorded under the old settings must not drive deletions.
+    for flag in ("plex_sync_watchlist", "plex_push_watchlist"):
+        if update_data.get(flag) and not getattr(conn, flag):
+            update_data["plex_watchlist_synced_keys"] = None
+            break
 
     for field, value in update_data.items():
         setattr(conn, field, value)
@@ -750,6 +956,50 @@ async def change_password(
     await db.commit()
     return {"status": "password updated"}
 
+@router.post("/change-email")
+@limiter.limit("5/minute")
+async def change_email(
+    request: Request,
+    email_in: schemas.EmailChange,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Change the account email (#471). Requires the current password when the
+    account has one (an OIDC-created account with none can change it directly,
+    same as change-password). With email validation on, the new address is
+    only switched in once its confirmation link is clicked; otherwise it
+    applies immediately."""
+    if current_user.password_hash is not None:
+        if not email_in.current_password or not verify_password(email_in.current_password, current_user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Incorrect current password",
+            )
+
+    new_email = email_in.new_email
+    if new_email.lower() == current_user.email.lower():
+        raise HTTPException(status_code=400, detail="That is already your email address")
+    if await _email_in_use(db, new_email, current_user.id):
+        raise HTTPException(status_code=400, detail="That email address is already in use")
+
+    if not app_settings.require_email_validation:
+        current_user.email = new_email
+        await db.commit()
+        return {"status": "email updated", "email": new_email}
+
+    # Only the latest request stays valid.
+    await db.execute(delete(EmailActivation).where(EmailActivation.user_id == current_user.id))
+    token = secrets.token_urlsafe(32)
+    db.add(EmailActivation(user_id=current_user.id, email=new_email, token=token))
+    await db.commit()
+    try:
+        await send_email_change_email(new_email, token)
+    except Exception as exc:
+        logger.error("Failed to send email change confirmation to %s: %s", new_email, exc)
+        raise HTTPException(status_code=502, detail="Could not send the confirmation email")
+    return {"status": "confirmation sent", "email": new_email}
+
+
 @router.post("/api-key/regenerate", response_model=schemas.User)
 async def regenerate_api_key(
     db: AsyncSession = Depends(get_db),
@@ -773,6 +1023,16 @@ async def test_tmdb(
         raise HTTPException(status_code=400, detail="Invalid TMDB API Key")
     return {"status": "ok", "message": "TMDB API key is valid."}
 
+@router.post("/test-rpdb")
+async def test_rpdb(
+    body: schemas.ApiKeyTestRequest,
+    response: Response,
+    current_user: User = Depends(get_current_user)
+):
+    from core import rpdb
+    _prevent_sensitive_response_caching(response)
+    return {"success": await rpdb.validate_api_key(body.key.get_secret_value())}
+
 @router.post("/test-tvdb")
 async def test_tvdb(
     body: schemas.ApiKeyTestRequest,
@@ -781,9 +1041,14 @@ async def test_tvdb(
 ):
     from core import tvdb
     _prevent_sensitive_response_caching(response)
-    success = await tvdb.validate_api_key(body.key.get_secret_value())
+    pin = body.pin.get_secret_value() if body.pin else None
+    success = await tvdb.validate_api_key(body.key.get_secret_value(), pin=pin)
     if not success:
-        raise HTTPException(status_code=400, detail="Invalid TVDB API Key")
+        raise HTTPException(
+            status_code=400,
+            detail="TVDB rejected the key" + (" / PIN" if pin else "")
+            + ". A subscriber-supported key needs its account PIN; a free project key needs no PIN.",
+        )
     return {"status": "ok", "message": "TVDB API key is valid."}
 
 @router.post("/test-jellyfin")
@@ -835,6 +1100,111 @@ async def test_plex(
     if not success:
         raise HTTPException(status_code=400, detail="Failed to connect to Plex")
     return {"status": "ok"}
+
+
+# ── "Login with Plex" (PIN auth) ──────────────────────────────────────────────
+
+# user_id -> {"pin_id": int, "client_id": str, "created_at": datetime}. Transient;
+# a pending PIN only needs to survive the ~2 min the user spends on app.plex.tv.
+_PLEX_PIN_CACHE: dict[int, dict] = {}
+_PLEX_PIN_TTL = timedelta(minutes=15)
+
+
+async def _get_plex_client_identifier(db: AsyncSession) -> str:
+    """Return this instance's stable X-Plex-Client-Identifier, generating and
+    persisting one on first use."""
+    gs = (await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))).scalar_one_or_none()
+    if gs is None:
+        gs = GlobalSettings(id=1)
+        db.add(gs)
+    if not gs.plex_client_identifier:
+        gs.plex_client_identifier = f"scrob-{secrets.token_hex(12)}"
+        await db.commit()
+    return gs.plex_client_identifier
+
+
+@router.post("/plex/pin/start")
+async def plex_pin_start(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Begin the "Login with Plex" flow. Returns a PIN code, the URL the user
+    opens to authorize it, and the poll interval."""
+    from core import plex
+
+    client_id = await _get_plex_client_identifier(db)
+    try:
+        pin = await plex.create_auth_pin(client_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach plex.tv: {exc}")
+
+    _PLEX_PIN_CACHE[current_user.id] = {
+        "pin_id": pin["id"],
+        "client_id": client_id,
+        "created_at": datetime.now(timezone.utc),
+    }
+    return {
+        "pin_id": pin["id"],
+        "auth_url": plex.build_auth_url(client_id, pin["code"]),
+        "interval": 2,
+    }
+
+
+@router.post("/plex/pin/poll")
+async def plex_pin_poll(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Check whether the user has authorized the PIN. While pending, returns
+    {status: "pending"}. Once claimed, returns the Plex account plus every server
+    it can reach, each with a ready-to-use URL and token for the connection form."""
+    from core import plex
+
+    entry = _PLEX_PIN_CACHE.get(current_user.id)
+    if not entry:
+        raise HTTPException(status_code=400, detail="No pending Plex login. Start again.")
+    if datetime.now(timezone.utc) - entry["created_at"] > _PLEX_PIN_TTL:
+        _PLEX_PIN_CACHE.pop(current_user.id, None)
+        raise HTTPException(status_code=400, detail="Plex login expired. Start again.")
+
+    try:
+        auth_token = await plex.poll_auth_pin(entry["client_id"], entry["pin_id"])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach plex.tv: {exc}")
+    if not auth_token:
+        return {"status": "pending"}
+
+    _PLEX_PIN_CACHE.pop(current_user.id, None)
+
+    account = await plex.get_account(entry["client_id"], auth_token)
+    if not account:
+        raise HTTPException(status_code=502, detail="Plex authorized but the account could not be read.")
+
+    try:
+        servers = await plex.get_servers(entry["client_id"], auth_token)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not list Plex servers: {exc}")
+
+    resolved = []
+    for server in servers:
+        probe = await plex.resolve_connections(server)
+        if not probe["connections"]:
+            continue
+        resolved.append({
+            "name": server["name"],
+            "machine_identifier": server["machine_identifier"],
+            "owned": server["owned"],
+            "token": server["access_token"],
+            "url": probe["recommended"],
+            "connections": probe["connections"],
+        })
+
+    return {
+        "status": "connected",
+        "account": account,
+        "auth_token": auth_token,
+        "servers": resolved,
+    }
 
 
 @router.post("/stremio/link/start")
@@ -1093,26 +1463,14 @@ async def get_connection_status(
         return {"configured": True, "connected": True, "quality_profiles": quality_profiles, "root_folders": root_folders, "tags": tags}
 
     async def check_trakt():
-        from core import trakt as trakt_client
-        from datetime import datetime, timezone
+        from routers.trakt import TraktTokenError, ensure_valid_trakt_token
         if not user_settings or not (user_settings.trakt_access_token and user_settings.trakt_client_id):
             return {"configured": False, "connected": False}
-        connected = await trakt_client.validate_token(user_settings.trakt_client_id, user_settings.trakt_access_token)
-        if not connected and user_settings.trakt_refresh_token and user_settings.trakt_client_secret:
-            try:
-                token_data = await trakt_client.refresh_access_token(
-                    user_settings.trakt_client_id,
-                    user_settings.trakt_client_secret,
-                    user_settings.trakt_refresh_token,
-                )
-                user_settings.trakt_access_token = token_data["access_token"]
-                user_settings.trakt_refresh_token = token_data["refresh_token"]
-                user_settings.trakt_token_expires_at = token_data.get("expires_in", 0) + int(datetime.now(timezone.utc).timestamp())
-                await db.commit()
-                connected = True
-            except Exception:
-                pass
-        return {"configured": True, "connected": connected}
+        try:
+            await ensure_valid_trakt_token(db, user_settings, force_check=True)
+            return {"configured": True, "connected": True}
+        except TraktTokenError:
+            return {"configured": True, "connected": False}
 
     async def check_media_server(conn):
         from core import arvio, jellyfin, nuvio, plex, stremio
@@ -1124,15 +1482,24 @@ async def get_connection_status(
                 profile_id = _parse_nuvio_profile_id(conn.server_user_id)
                 # Nuvio's refresh token is single-use; the lock keeps this
                 # status check from racing another request (e.g. a second
-                # open tab) that reads and redeems the same stale token.
+                # open tab) that reads and redeems the same stale token. The
+                # lock alone isn't enough though - conn was loaded before
+                # acquiring it, so a request that already rotated the token
+                # while this one waited would still leave conn.token stale;
+                # re-read it now that the lock is held.
                 async with nuvio.connection_lock(conn.id):
+                    await db.refresh(conn)
                     session, profiles = await nuvio.validate_connection(conn.url, conn.token, profile_id)
                     conn.token = session.refresh_token
                 conn.server_username = _nuvio_profile_name(profiles, profile_id)
                 connected = True
             elif conn.type == "arvio":
                 profile_id = conn.server_user_id if (conn.server_user_id and conn.server_user_id != "undefined") else None
+                # Same single-use rotating refresh token as Nuvio - see the
+                # comment on the Nuvio branch above. Re-read conn under the
+                # lock before redeeming its token.
                 async with arvio.connection_lock(conn.id):
+                    await db.refresh(conn)
                     session, profiles = await arvio.validate_connection(conn.url, conn.token, profile_id)
                     conn.token = session.refresh_token
                 if profile_id is None and profiles:
@@ -1171,8 +1538,24 @@ async def get_connection_status(
         from core import simkl as simkl_client
         if not user_settings or not (user_settings.simkl_access_token and user_settings.simkl_client_id):
             return {"configured": False, "connected": False}
+        from routers.simkl import ensure_simkl_token_fresh
+        await ensure_simkl_token_fresh(db, user_settings)
         connected = await simkl_client.validate_token(user_settings.simkl_client_id, user_settings.simkl_access_token)
         return {"configured": True, "connected": connected}
+
+    async def check_wetrakr():
+        from core import wetrakr as wetrakr_client
+        if not user_settings or not user_settings.wetrakr_access_token:
+            return {"configured": False, "connected": False}
+        # Refresh an expired token first (as Simkl's check does) - validating
+        # the stored one as-is reported a perfectly recoverable connection as
+        # disconnected once its short-lived access token lapsed.
+        from routers.wetrakr import WeTrakrTokenError, ensure_valid_wetrakr_token
+        try:
+            await ensure_valid_wetrakr_token(db, user_settings, force_check=True)
+        except WeTrakrTokenError:
+            return {"configured": True, "connected": False}
+        return {"configured": True, "connected": True}
 
     async def check_mdblist():
         from core import mdblist
@@ -1182,13 +1565,13 @@ async def get_connection_status(
         return {"configured": True, "connected": connected}
 
     media_server_tasks = [check_media_server(c) for c in media_server_conns]
-    rdr_status, snr_status, trakt_status, simkl_status, mdblist_status, *ms_statuses = await asyncio.gather(
-        check_radarr(), check_sonarr(), check_trakt(), check_simkl(), check_mdblist(), *media_server_tasks
+    rdr_status, snr_status, trakt_status, simkl_status, wetrakr_status, mdblist_status, *ms_statuses = await asyncio.gather(
+        check_radarr(), check_sonarr(), check_trakt(), check_simkl(), check_wetrakr(), check_mdblist(), *media_server_tasks
     )
     if any(conn.type in ("nuvio", "stremio") for conn in media_server_conns):
         await db.commit()
 
-    return {"radarr": rdr_status, "sonarr": snr_status, "trakt": trakt_status, "simkl": simkl_status, "mdblist": mdblist_status, "connections": ms_statuses}
+    return {"radarr": rdr_status, "sonarr": snr_status, "trakt": trakt_status, "simkl": simkl_status, "wetrakr": wetrakr_status, "mdblist": mdblist_status, "connections": ms_statuses}
 
 
 @router.post("/sonarr/profiles")
@@ -1320,8 +1703,10 @@ async def verify_2fa_login(
         if payload.get("type") != "2fa_pending":
             raise credentials_exception
         user_id = int(payload["sub"])
-    except (JWTError, ValueError, KeyError):
+        remember = bool(payload.get("remember"))
+    except (PyJWTError, ValueError, KeyError):
         raise credentials_exception
+    lifetime = session_lifetime(remember)
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -1330,7 +1715,13 @@ async def verify_2fa_login(
 
     # Try TOTP code
     if pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1):
-        return {"access_token": create_access_token(subject=user.id), "token_type": "bearer"}
+        return {
+            "access_token": create_access_token(
+                subject=user.id, expires_delta=lifetime, extra_claims=_session_claims(remember)
+            ),
+            "token_type": "bearer",
+            "expires_in": int(lifetime.total_seconds()),
+        }
 
     # Try backup code
     bc_result = await db.execute(
@@ -1344,6 +1735,342 @@ async def verify_2fa_login(
     if bc:
         bc.used = True
         await db.commit()
-        return {"access_token": create_access_token(subject=user.id), "token_type": "bearer"}
+        return {
+            "access_token": create_access_token(
+                subject=user.id, expires_delta=lifetime, extra_claims=_session_claims(remember)
+            ),
+            "token_type": "bearer",
+            "expires_in": int(lifetime.total_seconds()),
+        }
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid verification code")
+
+
+# --- OAuth 2.0 Device Authorization Grant (RFC 8628), #331 -------------------
+#
+# Lets third-party clients (e.g. the Umbrella Kodi add-on) obtain a
+# write-scoped access token without ever handling the user's password: the
+# client shows a short code, the user approves it from any logged-in browser
+# (so 2FA works untouched), and each grant is independently revocable from
+# Connected Apps. The resulting token is scope-limited - dependencies.py
+# rejects it on every account/security endpoint (see DEVICE_TOKEN_TYPE).
+#
+# All timestamps here are naive UTC (utcnow), matching the
+# oauth_device_grants columns, so comparisons never mix aware/naive.
+
+DEVICE_CODE_TTL = timedelta(minutes=15)
+DEVICE_ACCESS_TOKEN_TTL = timedelta(hours=24)
+DEVICE_POLL_INTERVAL = 5
+DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+SUPPORTED_DEVICE_SCOPES = {"write"}
+# Crockford-ish alphabet: no 0/O/1/I/L to keep the code unambiguous on a TV.
+_USER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _generate_user_code() -> str:
+    raw = "".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _normalize_user_code(value: str) -> str:
+    """Accept the code however the user typed it (lower-case, spaces, missing
+    dash) and return the canonical ``XXXX-XXXX`` form, or "" if it can't be
+    one."""
+    cleaned = "".join(c for c in (value or "").upper() if c in _USER_CODE_ALPHABET)
+    if len(cleaned) != 8:
+        return ""
+    return f"{cleaned[:4]}-{cleaned[4:]}"
+
+
+def _oauth_error(code: str, http_status: int = 400) -> JSONResponse:
+    return JSONResponse(status_code=http_status, content={"error": code})
+
+
+async def _read_token_params(request: Request) -> dict:
+    """RFC 8628 mandates application/x-www-form-urlencoded, but accept JSON too
+    since that's what the Trakt/Simkl device clients this mirrors tend to
+    send."""
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            data = await request.json()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+    try:
+        return {k: str(v) for k, v in (await request.form()).items()}
+    except Exception:
+        return {}
+
+
+def _issue_device_access_token(grant: OAuthDeviceGrant) -> dict:
+    access = create_access_token(
+        subject=grant.user_id,
+        expires_delta=DEVICE_ACCESS_TOKEN_TTL,
+        extra_claims={"type": DEVICE_TOKEN_TYPE, "scope": grant.scope, "jti": str(grant.id)},
+    )
+    return {
+        "access_token": access,
+        "token_type": "bearer",
+        "expires_in": int(DEVICE_ACCESS_TOKEN_TTL.total_seconds()),
+        "scope": grant.scope,
+    }
+
+
+@router.post("/device/code", response_model=schemas.DeviceCodeResponse)
+@limiter.limit("10/minute")
+async def device_code(
+    request: Request,
+    body: schemas.DeviceCodeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    scope = (body.scope or "write").strip().lower()
+    if scope not in SUPPORTED_DEVICE_SCOPES:
+        raise HTTPException(status_code=400, detail="Unsupported scope")
+    client_name = (body.client_name or "").strip()[:120] or "Unknown app"
+
+    now = utcnow()
+    # Opportunistic housekeeping so the table doesn't accumulate dead rows.
+    await db.execute(
+        delete(OAuthDeviceGrant).where(
+            or_(
+                and_(OAuthDeviceGrant.status.in_(("pending", "expired")), OAuthDeviceGrant.expires_at < now),
+                and_(OAuthDeviceGrant.status == "denied", OAuthDeviceGrant.created_at < now - timedelta(days=7)),
+                and_(OAuthDeviceGrant.revoked_at.isnot(None), OAuthDeviceGrant.revoked_at < now - timedelta(days=30)),
+            )
+        )
+    )
+
+    user_code = ""
+    for _ in range(6):
+        candidate = _generate_user_code()
+        clash = await db.execute(select(OAuthDeviceGrant.id).where(OAuthDeviceGrant.user_code == candidate))
+        if clash.scalar_one_or_none() is None:
+            user_code = candidate
+            break
+    if not user_code:
+        raise HTTPException(status_code=503, detail="Could not allocate a code, please retry")
+
+    device_code_raw = generate_opaque_token()
+    db.add(
+        OAuthDeviceGrant(
+            device_code_hash=hash_opaque_token(device_code_raw),
+            user_code=user_code,
+            client_name=client_name,
+            scope=scope,
+            status="pending",
+            interval=DEVICE_POLL_INTERVAL,
+            expires_at=now + DEVICE_CODE_TTL,
+        )
+    )
+    await db.commit()
+
+    base = app_settings.server_url.rstrip("/")
+    verification_uri = f"{base}/link"
+    return schemas.DeviceCodeResponse(
+        device_code=device_code_raw,
+        user_code=user_code,
+        verification_uri=verification_uri,
+        verification_uri_complete=f"{verification_uri}?code={user_code}",
+        expires_in=int(DEVICE_CODE_TTL.total_seconds()),
+        interval=DEVICE_POLL_INTERVAL,
+    )
+
+
+@router.post("/device/token")
+@limiter.limit("120/minute")
+async def device_token(request: Request, db: AsyncSession = Depends(get_db)):
+    params = await _read_token_params(request)
+    grant_type = (params.get("grant_type") or "").strip()
+
+    if grant_type in (DEVICE_GRANT_TYPE, "device_code"):
+        return await _device_token_exchange(db, params.get("device_code") or "")
+    if grant_type == "refresh_token":
+        return await _device_token_refresh(db, params.get("refresh_token") or "")
+    return _oauth_error("unsupported_grant_type")
+
+
+async def _device_token_exchange(db: AsyncSession, device_code_raw: str) -> JSONResponse | dict:
+    if not device_code_raw:
+        return _oauth_error("invalid_request")
+
+    result = await db.execute(
+        select(OAuthDeviceGrant).where(
+            OAuthDeviceGrant.device_code_hash == hash_opaque_token(device_code_raw)
+        )
+    )
+    grant = result.scalar_one_or_none()
+    if grant is None:
+        return _oauth_error("invalid_grant")
+
+    now = utcnow()
+
+    # The device_code is single-use: once tokens have been minted the client
+    # must use its refresh token.
+    if grant.token_issued_at is not None:
+        return _oauth_error("invalid_grant")
+
+    # Enforce the polling interval (RFC 8628 sec. 3.5).
+    if grant.last_polled_at is not None and (now - grant.last_polled_at).total_seconds() < grant.interval:
+        grant.interval += 5
+        grant.last_polled_at = now
+        await db.commit()
+        return _oauth_error("slow_down")
+    grant.last_polled_at = now
+
+    if grant.status in ("pending", "expired") and now >= grant.expires_at:
+        grant.status = "expired"
+        await db.commit()
+        return _oauth_error("expired_token")
+    if grant.status == "expired":
+        await db.commit()
+        return _oauth_error("expired_token")
+    if grant.status == "denied":
+        await db.commit()
+        return _oauth_error("access_denied")
+    if grant.status == "pending":
+        await db.commit()
+        return _oauth_error("authorization_pending")
+
+    # status == "approved"
+    refresh_raw = generate_opaque_token()
+    grant.refresh_token_hash = hash_opaque_token(refresh_raw)
+    grant.prev_refresh_token_hash = None
+    grant.token_issued_at = now
+    grant.last_seen_at = now
+    await db.commit()
+
+    payload = _issue_device_access_token(grant)
+    payload["refresh_token"] = refresh_raw
+    return payload
+
+
+async def _device_token_refresh(db: AsyncSession, refresh_raw: str) -> JSONResponse | dict:
+    if not refresh_raw:
+        return _oauth_error("invalid_request")
+
+    token_hash = hash_opaque_token(refresh_raw)
+    result = await db.execute(
+        select(OAuthDeviceGrant).where(OAuthDeviceGrant.refresh_token_hash == token_hash)
+    )
+    grant = result.scalar_one_or_none()
+
+    if grant is None:
+        # A refresh token we rotated away is being presented again - the only
+        # way that happens is a stolen copy racing the legitimate client.
+        # Kill the whole grant so neither party can use it.
+        replay = await db.execute(
+            select(OAuthDeviceGrant).where(OAuthDeviceGrant.prev_refresh_token_hash == token_hash)
+        )
+        stolen = replay.scalar_one_or_none()
+        if stolen is not None and stolen.revoked_at is None:
+            stolen.revoked_at = utcnow()
+            await db.commit()
+        return _oauth_error("invalid_grant")
+
+    if grant.revoked_at is not None or grant.status != "approved":
+        return _oauth_error("invalid_grant")
+
+    now = utcnow()
+    new_refresh = generate_opaque_token()
+    grant.prev_refresh_token_hash = grant.refresh_token_hash
+    grant.refresh_token_hash = hash_opaque_token(new_refresh)
+    grant.last_seen_at = now
+    await db.commit()
+
+    payload = _issue_device_access_token(grant)
+    payload["refresh_token"] = new_refresh
+    return payload
+
+
+async def _load_pending_grant(db: AsyncSession, user_code: str) -> OAuthDeviceGrant:
+    code = _normalize_user_code(user_code)
+    if not code:
+        raise HTTPException(status_code=404, detail="Unknown or expired code")
+    result = await db.execute(select(OAuthDeviceGrant).where(OAuthDeviceGrant.user_code == code))
+    grant = result.scalar_one_or_none()
+    if grant is None or grant.status != "pending" or utcnow() >= grant.expires_at:
+        raise HTTPException(status_code=404, detail="Unknown or expired code")
+    return grant
+
+
+@router.get("/device/pending", response_model=schemas.DevicePendingResponse)
+@limiter.limit("30/minute")
+async def device_pending(
+    request: Request,
+    user_code: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Describe a still-pending grant so the verification page can show the
+    user what they're about to authorize. Requires a normal logged-in session
+    (which is what makes 2FA a non-issue for the requesting device)."""
+    grant = await _load_pending_grant(db, user_code)
+    return schemas.DevicePendingResponse(
+        client_name=grant.client_name,
+        scope=grant.scope,
+        requested_at=grant.created_at,
+    )
+
+
+@router.post("/device/approve")
+@limiter.limit("20/minute")
+async def device_approve(
+    request: Request,
+    body: schemas.DeviceApproveRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    action = (body.action or "").strip().lower()
+    if action not in ("approve", "deny"):
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    grant = await _load_pending_grant(db, body.user_code)
+    grant.user_id = current_user.id
+    if action == "approve":
+        grant.status = "approved"
+        grant.approved_at = utcnow()
+        chosen_name = (body.name or "").strip()[:120]
+        if chosen_name:
+            grant.client_name = chosen_name
+    else:
+        grant.status = "denied"
+    await db.commit()
+    return {"status": grant.status}
+
+
+@router.get("/device/grants", response_model=list[schemas.DeviceGrantItem])
+async def list_device_grants(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(OAuthDeviceGrant)
+        .where(
+            OAuthDeviceGrant.user_id == current_user.id,
+            OAuthDeviceGrant.status == "approved",
+            OAuthDeviceGrant.revoked_at.is_(None),
+        )
+        .order_by(OAuthDeviceGrant.approved_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.delete("/device/grants/{grant_id}")
+async def revoke_device_grant(
+    grant_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(OAuthDeviceGrant).where(
+            OAuthDeviceGrant.id == grant_id,
+            OAuthDeviceGrant.user_id == current_user.id,
+        )
+    )
+    grant = result.scalar_one_or_none()
+    if grant is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if grant.revoked_at is None:
+        grant.revoked_at = utcnow()
+        await db.commit()
+    return {"status": "revoked"}

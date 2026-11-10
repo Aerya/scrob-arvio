@@ -1,6 +1,7 @@
 ---
 import MediaRow from "../../components/MediaRow.astro";
 import { api } from "../../lib/api";
+import { m } from "../../paraglide/messages.js";
 
 export const partial = true;
 
@@ -8,7 +9,7 @@ const token = Astro.cookies.get("token")?.value;
 const type = Astro.url.searchParams.get("type");
 const id = Astro.url.searchParams.get("id");
 
-if (!token || !type || !id) {
+if (!type || !id) {
   return new Response(null, { status: 400 });
 }
 
@@ -30,4 +31,4 @@ if (recommendations.length === 0) {
 }
 ---
 
-<MediaRow title="More like this" items={recommendations} />
+<MediaRow title={m.recommendations_more_like_this()} items={recommendations} />

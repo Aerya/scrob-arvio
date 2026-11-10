@@ -19,8 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core import trakt as trakt_client
 from core.enrichment import enrich_media, is_unmapped_tvdb_episode, create_media_safely
+from core.identity import coerce_id
+from core.native_watchlist import split_key, sync_service_watchlist, watchlist_lock
+from core.watchlist_reconcile import media_key
 from core.trakt_export import MAX_TOTAL_SIZE, TraktExportData, parse_trakt_export
 from core.rewatch import record_rewatch_progress
+from core.watch_dedup import DEFAULT_DEDUP_WINDOW_MINUTES, dedup_window_from_settings, is_duplicate_watch_time, load_existing_watch_times
 from db import get_db, engine
 from dependencies import get_current_user
 from models.base import CollectionSource, MediaType
@@ -34,6 +38,8 @@ from models.show import Show
 from models.sync import SyncJob, SyncStatus
 from models.users import User, UserSettings
 from models.global_settings import GlobalSettings
+from sqlalchemy.orm.attributes import flag_modified
+from core.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +48,86 @@ router = APIRouter()
 TMDB_CONCURRENCY = 10
 TRAKT_HISTORY_OVERLAP = timedelta(minutes=5)
 TRAKT_HISTORY_PUSH_BATCH_SIZE = 100
+TRAKT_RATINGS_PUSH_BATCH_SIZE = 100
+# Trakt throttles authenticated writes to ~1/s (429 beyond). Run the push queue
+# one request at a time with this gap so a big push can't 429-storm itself or
+# starve the user's real-time scrobbles, which share the same quota (#327).
+TRAKT_PUSH_REQUEST_GAP = 1.0
+
+# Trakt device-auth access tokens live 7 days. Refresh once we're within this
+# of expiry so a job (or scrobble) that starts near the boundary doesn't race it.
+_TRAKT_TOKEN_REFRESH_SKEW = timedelta(days=1)
+
+
+class TraktTokenError(Exception):
+    """The stored Trakt token is unusable and can't be refreshed automatically -
+    the user needs to reconnect Trakt in Settings. The message is safe to show."""
+
+
+async def ensure_valid_trakt_token(
+    db: AsyncSession, settings: UserSettings | None, *, force_check: bool = False
+) -> str:
+    """Return a usable Trakt access token, refreshing and persisting it first if
+    it's expired or close to it. Raises TraktTokenError when Trakt isn't
+    connected or a needed refresh isn't possible / fails.
+
+    EVERY path that calls Trakt with the stored token must go through this. The
+    scheduled push used to skip it entirely and 401-loop for days once a week -
+    until a Settings-page visit happened to refresh the token as a side effect
+    (GitHub #326). The sync/pull path and the Settings status check did their
+    own inline validate-and-refresh; this consolidates all three.
+
+    force_check skips the "expiry is comfortably far off, trust it" fast path and
+    always hits Trakt - used by the Settings status check so a token revoked on
+    trakt.tv still shows as disconnected before it expires.
+    """
+    if not settings or not settings.trakt_access_token or not settings.trakt_client_id:
+        raise TraktTokenError("Trakt is not connected.")
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    expires_at = settings.trakt_token_expires_at
+    # Comfortably before a known expiry: trust the token, skip the round trip.
+    if not force_check and expires_at and expires_at - now > _TRAKT_TOKEN_REFRESH_SKEW.total_seconds():
+        return settings.trakt_access_token
+
+    if await trakt_client.validate_token(settings.trakt_client_id, settings.trakt_access_token):
+        return settings.trakt_access_token
+
+    if not (settings.trakt_refresh_token and settings.trakt_client_secret):
+        raise TraktTokenError("Trakt token expired. Please reconnect Trakt in Settings.")
+
+    try:
+        token_data = await trakt_client.refresh_access_token(
+            settings.trakt_client_id,
+            settings.trakt_client_secret,
+            settings.trakt_refresh_token,
+        )
+    except Exception as exc:
+        logger.warning("Trakt token refresh failed for user %s: %s", settings.user_id, exc)
+        raise TraktTokenError(f"Trakt token expired and the automatic refresh failed: {exc}") from exc
+
+    settings.trakt_access_token = token_data["access_token"]
+    settings.trakt_refresh_token = token_data["refresh_token"]
+    settings.trakt_token_expires_at = token_data.get("expires_in", 0) + int(
+        datetime.now(timezone.utc).timestamp()
+    )
+    await db.commit()
+    logger.info("Refreshed Trakt access token for user %s", settings.user_id)
+    return settings.trakt_access_token
+
+
+async def ensure_valid_trakt_token_for_user(user_id: int) -> str:
+    """ensure_valid_trakt_token with its own short-lived session. For callers
+    that run inside a concurrently-gathered push task or otherwise can't have a
+    token refresh commit their request session (the webhook scrobble path, the
+    sync fan-out) - same reasoning as _record_plex_pending_push in routers/sync.
+    """
+    maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with maker() as db:
+        settings = (
+            await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+        ).scalar_one_or_none()
+        return await ensure_valid_trakt_token(db, settings)
 
 
 def _normalize_history_time(value: datetime | None) -> datetime | None:
@@ -61,30 +147,77 @@ def _history_window(
     return start_at, cutoff
 
 
-def _remote_history_keys(
+def _remote_history_times(
     movies: list[dict],
     episodes: list[dict],
-) -> set[tuple]:
-    keys: set[tuple] = set()
+) -> dict[tuple, list[datetime | None]]:
+    """Group remote play timestamps by item identity (no timestamp in the key),
+    so the push dedup can match a local watch against a remote play of the same
+    item that lands a few seconds off - Trakt records its own receipt time, not
+    the media server's, so an exact-timestamp match misses and the event is
+    re-sent every push (#327)."""
+    out: dict[tuple, list[datetime | None]] = {}
     for item in movies:
         tmdb_id = item.get("movie", {}).get("ids", {}).get("tmdb")
-        watched_at = _parse_trakt_datetime(item.get("watched_at"))
         if tmdb_id:
-            keys.add(("movie", int(tmdb_id), _normalize_history_time(watched_at)))
+            out.setdefault(("movie", int(tmdb_id)), []).append(
+                _normalize_history_time(_parse_trakt_datetime(item.get("watched_at")))
+            )
     for item in episodes:
         show_tmdb_id = item.get("show", {}).get("ids", {}).get("tmdb")
         episode = item.get("episode", {})
         season = episode.get("season")
         number = episode.get("number")
-        watched_at = _parse_trakt_datetime(item.get("watched_at"))
         if show_tmdb_id and season is not None and number is not None:
-            keys.add((
-                "episode",
-                int(show_tmdb_id),
-                int(season),
-                int(number),
-                _normalize_history_time(watched_at),
-            ))
+            out.setdefault(("episode", int(show_tmdb_id), int(season), int(number)), []).append(
+                _normalize_history_time(_parse_trakt_datetime(item.get("watched_at")))
+            )
+    return out
+
+
+def _history_play_seen(
+    remote_times: dict[tuple, list[datetime | None]],
+    identity: tuple,
+    local_at: datetime | None,
+) -> bool:
+    """True if Trakt already has a play of `identity` that should count as the
+    same watch as a local one at `local_at`. An unknown-dated local watch
+    matches any remote play of the same item; a dated one matches a remote play
+    within TRAKT_HISTORY_OVERLAP (so second-level clock drift doesn't re-send it,
+    while a genuine rewatch hours/days later still gets pushed)."""
+    seen = remote_times.get(identity)
+    if not seen:
+        return False
+    if local_at is None:
+        return True
+    tolerance = TRAKT_HISTORY_OVERLAP.total_seconds()
+    return any(
+        remote_at is not None and abs((remote_at - local_at).total_seconds()) <= tolerance
+        for remote_at in seen
+    )
+
+
+def _remote_collection_keys(collection: dict) -> set[tuple]:
+    """Identity keys for everything already in the user's Trakt collection, so
+    the outbound collection push can skip them instead of re-POSTing the whole
+    library every run (#327)."""
+    keys: set[tuple] = set()
+    for item in collection.get("movies", []):
+        tmdb_id = (item.get("movie", {}).get("ids", {}) or {}).get("tmdb")
+        if tmdb_id is not None:
+            keys.add(("movie", int(tmdb_id)))
+    for item in collection.get("shows", []):
+        show_tmdb_id = (item.get("show", {}).get("ids", {}) or {}).get("tmdb")
+        if show_tmdb_id is None:
+            continue
+        for season in item.get("seasons", []) or []:
+            snum = season.get("number")
+            if snum is None:
+                continue
+            for episode in season.get("episodes", []) or []:
+                enum = episode.get("number")
+                if enum is not None:
+                    keys.add(("episode", int(show_tmdb_id), int(snum), int(enum)))
     return keys
 
 
@@ -314,7 +447,7 @@ async def _get_or_create_person_media(db: AsyncSession, tmdb_id: int, name: str,
 
 def _trakt_rated_at(value: str | None) -> datetime:
     if not value:
-        return datetime.utcnow()
+        return utcnow()
     from dateutil import parser as dt_parser
 
     parsed = dt_parser.isoparse(value)
@@ -478,6 +611,120 @@ class ExportTraktSource:
         return self.data.comments
 
 
+_UNIMPORTED_CAP = 200
+
+
+def _note_unimported(stats: dict, label: str, reason: str) -> None:
+    """Remember an item the import couldn't bring in (as opposed to one it
+    skipped because it was already there), so the job summary can list them (#454)."""
+    items = stats.setdefault("unimported", [])
+    if len(items) < _UNIMPORTED_CAP:
+        items.append(f"{label} ({reason})")
+    else:
+        stats["unimported_more"] = stats.get("unimported_more", 0) + 1
+
+
+def _trakt_watchlist_remote(db: AsyncSession, entries: list[dict], api_key: str | None) -> dict:
+    """Typed key -> media resolver for every Trakt watchlist entry with a
+    TMDB id."""
+    remote = {}
+    for entry in entries:
+        item_type = entry.get("type")
+        if item_type not in ("movie", "show"):
+            continue
+        data = entry.get(item_type) or {}
+        tmdb_id = coerce_id((data.get("ids") or {}).get("tmdb"))
+        if not tmdb_id:
+            continue
+        getter = _get_or_create_movie_media if item_type == "movie" else _get_or_create_series_media
+
+        async def _resolve(getter=getter, tmdb_id=tmdb_id, title=data.get("title", "")):
+            return await getter(db, tmdb_id, title, api_key)
+
+        remote[media_key(item_type, tmdb_id)] = _resolve
+    return remote
+
+
+def _trakt_watchlist_items(keys: list[str]) -> dict[str, list[dict]]:
+    items: dict[str, list[dict]] = {"movies": [], "shows": []}
+    for key in keys:
+        kind, tmdb_id = split_key(key)
+        items["movies" if kind == "movie" else "shows"].append({"ids": {"tmdb": tmdb_id}})
+    return items
+
+
+def _trakt_not_found_keys(response: dict, keys: list[str]) -> set[str]:
+    failed: set[str] = set()
+    for kind, key_kind in (("movies", "movie"), ("shows", "show")):
+        for item in (response.get("not_found") or {}).get(kind) or []:
+            tmdb_id = coerce_id(((item or {}).get("ids") or {}).get("tmdb"))
+            if tmdb_id:
+                failed.add(media_key(key_kind, tmdb_id))
+    return failed & set(keys)
+
+
+async def _sync_trakt_watchlist(
+    db: AsyncSession,
+    user_id: int,
+    settings: UserSettings,
+    client_id: str,
+    access_token: str,
+    api_key: str | None,
+    stats: dict,
+) -> None:
+    """Reconcile the Trakt watchlist with the native Scrob watchlist, in the
+    directions trakt_sync_lists / trakt_push_lists allow."""
+    pull_enabled = bool(settings.trakt_sync_lists)
+    push_enabled = bool(settings.trakt_push_lists)
+    if not (pull_enabled or push_enabled):
+        return
+
+    print(f"  Fetching watchlist from Trakt...")
+    entries = await trakt_client.get_watchlist(client_id, access_token)
+    print(f"  {len(entries)} watchlist items fetched from Trakt")
+
+    async def _push(keys: list[str], remove: bool) -> set[str]:
+        failed: set[str] = set()
+        for start in range(0, len(keys), 100):
+            batch = keys[start:start + 100]
+            try:
+                response = await trakt_client.update_watchlist(
+                    client_id, access_token, _trakt_watchlist_items(batch), remove=remove,
+                )
+            except Exception as exc:
+                logger.warning("Trakt watchlist %s failed for %d item(s): %s", "remove" if remove else "add", len(batch), exc)
+                failed.update(batch)
+                continue
+            if not remove:  # not found on a removal means it's already gone
+                failed |= _trakt_not_found_keys(response, batch)
+        return failed
+
+    async def _push_add(keys, _local):
+        return await _push(keys, remove=False)
+
+    async def _push_remove(keys, _local):
+        return await _push(keys, remove=True)
+
+    async with watchlist_lock(user_id):
+        result = await sync_service_watchlist(
+            db, user_id,
+            service="Trakt",
+            remote=_trakt_watchlist_remote(db, entries, api_key),
+            baseline=settings.trakt_watchlist_synced_keys,
+            pull_enabled=pull_enabled,
+            push_enabled=push_enabled,
+            push_add=_push_add,
+            push_remove=_push_remove,
+        )
+        if result.baseline is not None:
+            settings.trakt_watchlist_synced_keys = result.baseline
+        await db.commit()
+    stats["list_items"] += result.added
+    stats["watchlist_removed"] = result.removed
+    stats["watchlist_pushed"] = result.pushed_added
+    stats["watchlist_unpushed"] = result.pushed_removed
+
+
 async def _apply_trakt_import(
     db: AsyncSession,
     job_id: int,
@@ -487,9 +734,10 @@ async def _apply_trakt_import(
     sync_watched: bool,
     sync_ratings: bool,
     sync_lists: bool,
-    split_watchlist: bool,
+    split_watchlist: bool,  # unused: the watchlist goes to the native one, unsplit
     history_start: datetime | None,
     history_end: datetime,
+    window_minutes: int = DEFAULT_DEDUP_WINDOW_MINUTES,
 ) -> tuple[dict, int, bool, set[int], RatingChanges]:
     """Fetches (from `source`) and applies watched history, ratings, and lists.
 
@@ -515,6 +763,15 @@ async def _apply_trakt_import(
     # season from TMDB instead of once.
     season_cache: dict[tuple[int, int], dict] = {}
 
+    def _is_duplicate_play(existing_times: dict[int, list[datetime]], media_id: int, watched_at: datetime | None) -> bool:
+        # An unknown-dated play matches any existing play of the same item,
+        # dated or not - there's nothing to compare a window against, and this
+        # matches the identity-only convention used elsewhere for unknown
+        # dates (see _history_play_seen).
+        if watched_at is None:
+            return bool(existing_times.get(media_id))
+        return is_duplicate_watch_time(existing_times, media_id, watched_at, window_minutes)
+
     # ── Watched Movies ────────────────────────────────────────────────
     # Uses /sync/history (one row per play) rather than /sync/watched
     # (one aggregated row per title) so every distinct play of a movie
@@ -526,17 +783,14 @@ async def _apply_trakt_import(
             end_at=history_end,
         )
         print(f"  {len(history_movies)} movie plays fetched from Trakt")
-        await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(total_items=len(history_movies)))
+        await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(total_items=len(history_movies), current_step="Pulling watched movies"))
         await db.commit()
 
-        # Pre-load existing watch events for this user, keyed by the
-        # exact play (media_id, watched_at) so re-syncing doesn't
-        # duplicate plays already imported, while still allowing
-        # multiple distinct plays of the same title.
-        we_res = await db.execute(
-            select(WatchEvent.media_id, WatchEvent.watched_at).where(WatchEvent.user_id == user_id)
-        )
-        existing_watched: set[tuple[int, datetime]] = {(row[0], row[1]) for row in we_res}
+        # Pre-load every existing watch's effective time for this user, keyed
+        # by media_id, so re-syncing doesn't duplicate a play that's already
+        # been imported (from Trakt or anywhere else, within the dedup
+        # window - #390) while still allowing genuinely distinct rewatches.
+        existing_times = await load_existing_watch_times(db, user_id)
 
         for movie_index, item in enumerate(history_movies, start=1):
             movie_data = item.get("movie", {})
@@ -544,28 +798,30 @@ async def _apply_trakt_import(
             try:
                 if not tmdb_id:
                     stats["skipped"] += 1
+                    _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', "no TMDB id")
                     continue
                 try:
                     async with db.begin_nested():
                         media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
                         if not media:
                             stats["errors"] += 1
+                            _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', f"tmdb:{tmdb_id} not found")
                             continue
                         # A dateless play (submitted with watched_at="unknown", which Trakt
                         # silently stores/returns as the Unix epoch — see
                         # _TRAKT_UNKNOWN_DATE_EPOCH) is stored as unknown locally too,
                         # rather than fabricating a "now" timestamp or importing 1970-01-01.
                         watched_at = _parse_trakt_datetime(item.get("watched_at"))
-                        key = (media.id, watched_at)
-                        if key not in existing_watched:
+                        if not _is_duplicate_play(existing_times, media.id, watched_at):
                             db.add(WatchEvent(
                                 user_id=user_id,
+                                source="trakt",
                                 media_id=media.id,
                                 watched_at=watched_at,
                                 completed=True,
                                 play_count=1,
                             ))
-                            existing_watched.add(key)
+                            existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                             _new_watched.add(media.id)
                             stats["movies"] += 1
                         else:
@@ -600,14 +856,12 @@ async def _apply_trakt_import(
         await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(
             total_items=len(history_movies) + len(history_episodes),
             processed_items=watched_processed,
+            current_step="Pulling watched shows",
         ))
         await db.commit()
 
-        # Re-fetch watched set (may have grown from movie sync)
-        we_res = await db.execute(
-            select(WatchEvent.media_id, WatchEvent.watched_at).where(WatchEvent.user_id == user_id)
-        )
-        existing_watched = {(row[0], row[1]) for row in we_res}
+        # Re-fetch watch times (may have grown from movie sync)
+        existing_times = await load_existing_watch_times(db, user_id)
 
         # Group plays by show so _get_or_create_show only runs once per show
         plays_by_show: dict[int, list[dict]] = {}
@@ -617,6 +871,7 @@ async def _apply_trakt_import(
                 plays_by_show.setdefault(show_tmdb_id, []).append(entry)
             else:
                 stats["skipped"] += 1
+                _note_unimported(stats, f'show "{entry.get("show", {}).get("title", "?")}"', "no TMDB id")
 
         async def process_show(show_tmdb_id: int, entries: list[dict]):
             show_title = entries[0].get("show", {}).get("title", "")
@@ -625,6 +880,7 @@ async def _apply_trakt_import(
                     show = await _get_or_create_show(db, show_tmdb_id, show_title, api_key)
                     if not show:
                         stats["errors"] += 1
+                        _note_unimported(stats, f'show "{show_title}"', f"tmdb:{show_tmdb_id} not found")
                         return
                     await db.flush()
 
@@ -634,6 +890,7 @@ async def _apply_trakt_import(
                     ep_num = ep_data.get("number")
                     if season_num is None or ep_num is None:
                         stats["skipped"] += 1
+                        _note_unimported(stats, f'show "{show_title}" episode', "no season/episode number")
                         continue
                     try:
                         async with db.begin_nested():
@@ -642,14 +899,15 @@ async def _apply_trakt_import(
                             )
                             if not media:
                                 stats["errors"] += 1
+                                _note_unimported(stats, f'show "{show_title}" S{season_num}E{ep_num}', "episode not found on TMDB")
                                 continue
                             # See the movie-import branch above: preserve an unknown
                             # date as unknown rather than fabricating "now".
                             watched_at = _parse_trakt_datetime(entry.get("watched_at"))
-                            key = (media.id, watched_at)
-                            if key not in existing_watched:
+                            if not _is_duplicate_play(existing_times, media.id, watched_at):
                                 event = WatchEvent(
                                     user_id=user_id,
+                                    source="trakt",
                                     media_id=media.id,
                                     watched_at=watched_at,
                                     completed=True,
@@ -658,7 +916,7 @@ async def _apply_trakt_import(
                                 db.add(event)
                                 await db.flush()
                                 await record_rewatch_progress(db, user_id, media.id, event.id)
-                                existing_watched.add(key)
+                                existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                                 _new_watched.add(media.id)
                                 stats["episodes"] += 1
                             else:
@@ -776,160 +1034,21 @@ async def _apply_trakt_import(
 
     # ── Lists (watchlist + personal lists) ───────────────────────────
     if sync_lists:
-        WATCHLIST_SLUG         = "__watchlist__"
-        WATCHLIST_MOVIES_SLUG  = "__watchlist_movies__"
-        WATCHLIST_SHOWS_SLUG   = "__watchlist_shows__"
-
-        print(f"  Fetching watchlist from Trakt...")
-        watchlist_items = await source.get_watchlist()
-        print(f"  {len(watchlist_items)} watchlist items fetched from Trakt")
-
-        if split_watchlist:
-            # ── Split mode: two lists keyed by media type ─────────────
-            async def _get_or_create_split_list(slug: str, name: str) -> ListModel:
-                r = await db.execute(
-                    select(ListModel).where(ListModel.user_id == user_id, ListModel.trakt_slug == slug)
+        if not isinstance(source, LiveTraktSource):
+            # An export file is a one-off snapshot: add what it lists, never
+            # remove. The live sync reconciles separately (_sync_trakt_watchlist).
+            print(f"  Reading watchlist from the Trakt export...")
+            watchlist_items = await source.get_watchlist()
+            async with watchlist_lock(user_id):
+                result = await sync_service_watchlist(
+                    db, user_id,
+                    service="Trakt export",
+                    remote=_trakt_watchlist_remote(db, watchlist_items, api_key),
+                    baseline=None,
+                    pull_enabled=True,
+                    push_enabled=False,
                 )
-                lst = r.scalar_one_or_none()
-                if not lst:
-                    lst = ListModel(user_id=user_id, name=name, trakt_slug=slug)
-                    db.add(lst)
-                    await db.flush()
-                    stats["lists"] += 1
-                return lst
-
-            movies_list = await _get_or_create_split_list(WATCHLIST_MOVIES_SLUG, "Trakt - Watchlist (Movies)")
-            shows_list  = await _get_or_create_split_list(WATCHLIST_SHOWS_SLUG,  "Trakt - Watchlist (Shows)")
-
-            movies_existing = {row[0] for row in (await db.execute(
-                select(ListItem.media_id).where(ListItem.list_id == movies_list.id)
-            )).all()}
-            shows_existing  = {row[0] for row in (await db.execute(
-                select(ListItem.media_id).where(ListItem.list_id == shows_list.id)
-            )).all()}
-
-            # Reconcile: remove items no longer on Trakt watchlist
-            trakt_movie_tmdb_ids = {
-                e.get("movie", {}).get("ids", {}).get("tmdb")
-                for e in watchlist_items if e.get("type") == "movie"
-            } - {None}
-            trakt_show_tmdb_ids = {
-                e.get("show", {}).get("ids", {}).get("tmdb")
-                for e in watchlist_items if e.get("type") == "show"
-            } - {None}
-
-            # Remove stale movies
-            if movies_existing:
-                stale_movies_result = await db.execute(
-                    select(Media).where(
-                        Media.id.in_(movies_existing),
-                        Media.tmdb_id.notin_(trakt_movie_tmdb_ids),
-                    )
-                )
-                for stale in stale_movies_result.scalars():
-                    await db.execute(
-                        ListItem.__table__.delete().where(
-                            ListItem.list_id == movies_list.id,
-                            ListItem.media_id == stale.id,
-                        )
-                    )
-                    movies_existing.discard(stale.id)
-
-            # Remove stale shows
-            if shows_existing:
-                stale_shows_result = await db.execute(
-                    select(Media).where(
-                        Media.id.in_(shows_existing),
-                        Media.tmdb_id.notin_(trakt_show_tmdb_ids),
-                    )
-                )
-                for stale in stale_shows_result.scalars():
-                    await db.execute(
-                        ListItem.__table__.delete().where(
-                            ListItem.list_id == shows_list.id,
-                            ListItem.media_id == stale.id,
-                        )
-                    )
-                    shows_existing.discard(stale.id)
-
-            for entry in watchlist_items:
-                item_type = entry.get("type")
-                media: Media | None = None
-                try:
-                    if item_type == "movie":
-                        movie_data = entry.get("movie", {})
-                        tmdb_id_item = movie_data.get("ids", {}).get("tmdb")
-                        if not tmdb_id_item:
-                            continue
-                        async with db.begin_nested():
-                            media = await _get_or_create_movie_media(db, tmdb_id_item, movie_data.get("title", ""), api_key)
-                        if media and media.id not in movies_existing:
-                            db.add(ListItem(list_id=movies_list.id, media_id=media.id))
-                            movies_existing.add(media.id)
-                            stats["list_items"] += 1
-                    elif item_type == "show":
-                        show_data = entry.get("show", {})
-                        tmdb_id_item = show_data.get("ids", {}).get("tmdb")
-                        if not tmdb_id_item:
-                            continue
-                        async with db.begin_nested():
-                            media = await _get_or_create_series_media(db, tmdb_id_item, show_data.get("title", ""), api_key)
-                        if media and media.id not in shows_existing:
-                            db.add(ListItem(list_id=shows_list.id, media_id=media.id))
-                            shows_existing.add(media.id)
-                            stats["list_items"] += 1
-                except Exception as exc:
-                    logger.warning("Error processing Trakt watchlist item (%s): %s", item_type, exc)
-                    stats["errors"] += 1
-
-        else:
-            # ── Unified mode: one list for movies + shows ─────────────
-            wl_result = await db.execute(
-                select(ListModel).where(
-                    ListModel.user_id == user_id,
-                    ListModel.trakt_slug == WATCHLIST_SLUG,
-                )
-            )
-            watchlist = wl_result.scalar_one_or_none()
-            if not watchlist:
-                watchlist = ListModel(user_id=user_id, name="Trakt - Watchlist", trakt_slug=WATCHLIST_SLUG)
-                db.add(watchlist)
-                await db.flush()
-                stats["lists"] += 1
-
-            wl_items_result = await db.execute(
-                select(ListItem.media_id).where(ListItem.list_id == watchlist.id)
-            )
-            wl_existing_ids: set[int] = {row[0] for row in wl_items_result}
-
-            for entry in watchlist_items:
-                item_type = entry.get("type")
-                media: Media | None = None
-                try:
-                    if item_type == "movie":
-                        movie_data = entry.get("movie", {})
-                        tmdb_id_item = movie_data.get("ids", {}).get("tmdb")
-                        if not tmdb_id_item:
-                            continue
-                        async with db.begin_nested():
-                            media = await _get_or_create_movie_media(db, tmdb_id_item, movie_data.get("title", ""), api_key)
-                    elif item_type == "show":
-                        show_data = entry.get("show", {})
-                        tmdb_id_item = show_data.get("ids", {}).get("tmdb")
-                        if not tmdb_id_item:
-                            continue
-                        async with db.begin_nested():
-                            media = await _get_or_create_series_media(db, tmdb_id_item, show_data.get("title", ""), api_key)
-                    else:
-                        continue
-
-                    if media and media.id not in wl_existing_ids:
-                        db.add(ListItem(list_id=watchlist.id, media_id=media.id))
-                        wl_existing_ids.add(media.id)
-                        stats["list_items"] += 1
-                except Exception as exc:
-                    logger.warning("Error processing Trakt watchlist item (%s): %s", item_type, exc)
-                    stats["errors"] += 1
+            stats["list_items"] += result.added
 
         await db.commit()
 
@@ -1044,6 +1163,14 @@ async def _apply_trakt_import(
 
 
 def _trakt_import_summary(job_id: int, label: str, stats: dict) -> str:
+    unimported = stats.get("unimported") or []
+    if unimported:
+        more = stats.get("unimported_more", 0)
+        logger.warning(
+            "Trakt %s job %s could not import %d item(s): %s%s",
+            label, job_id, len(unimported) + more, "; ".join(unimported),
+            f" (+{more} more)" if more else "",
+        )
     return (
         f"Trakt {label} job {job_id} completed. "
         f"Movies: {stats['movies']} new, {stats.get('skipped', 0)} skipped. "
@@ -1055,8 +1182,75 @@ def _trakt_import_summary(job_id: int, label: str, stats: dict) -> str:
     )
 
 
+async def _apply_dropped_shows_import(db: AsyncSession, user_id: int, dropped_items: list[dict]) -> int:
+    """Merges a provider's dropped-shows list into the local dropped_shows
+    setting (#117 follow-up). Shared by Trakt and MDBList - both return
+    dropped items shaped {..., "show": {"ids": {"tmdb": ...}}}. Only shows
+    already known locally can be mapped (dropped_shows stores local Show.id,
+    not tmdb_id), so a show Scrob has never seen is silently skipped rather
+    than force-creating a local Show row just to hide it.
+
+    Additive only, like the rest of this pull: a show un-dropped on Trakt
+    does not get removed from Scrob's local dropped_shows here.
+    """
+    tmdb_ids = {
+        item.get("show", {}).get("ids", {}).get("tmdb")
+        for item in dropped_items
+    }
+    tmdb_ids.discard(None)
+    if not tmdb_ids:
+        return 0
+
+    shows_result = await db.execute(select(Show.id).where(Show.tmdb_id.in_(tmdb_ids)))
+    local_show_ids = {row[0] for row in shows_result.all()}
+    if not local_show_ids:
+        return 0
+
+    settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+    settings = settings_result.scalar_one_or_none()
+    if not settings:
+        return 0
+
+    dropped = set(settings.dropped_shows or [])
+    new_ids = local_show_ids - dropped
+    if new_ids:
+        settings.dropped_shows = list(dropped | new_ids)
+        flag_modified(settings, "dropped_shows")
+        await db.commit()
+    return len(new_ids)
+
+
+async def _local_dropped_show_tmdb_ids(
+    db: AsyncSession, settings: UserSettings, *, watched_by_user_id: int | None = None
+) -> set[int]:
+    """TMDB ids of the shows the user has dropped locally. dropped_shows stores
+    local Show.id values, so this resolves them; a dropped show with no tmdb_id
+    (TVDB-only) can't be pushed to Trakt/MDBList and is dropped from the set.
+
+    When watched_by_user_id is given, only shows with at least one completed
+    WatchEvent for that user are returned. Trakt's hidden/dropped list is a
+    view over the progress / Up Next section, which only ever contains shows
+    you have started: POST /users/hidden/dropped accepts a never-watched show
+    (added: 1) but it never materializes in the GET, so the reconcile would
+    keep re-pushing it every run forever (#329)."""
+    if not settings.dropped_shows:
+        return set()
+    query = select(Show.tmdb_id).where(
+        Show.id.in_(settings.dropped_shows), Show.tmdb_id.isnot(None)
+    )
+    if watched_by_user_id is not None:
+        query = (
+            query.join(Media, Media.show_id == Show.id)
+            .join(WatchEvent, WatchEvent.media_id == Media.id)
+            .where(WatchEvent.user_id == watched_by_user_id, WatchEvent.completed == True)
+            .distinct()
+        )
+    result = await db.execute(query)
+    return {row[0] for row in result.all()}
+
+
 async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     print(f"Starting Trakt sync for user {user_id}, job {job_id}")
     async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with async_session() as db:
@@ -1083,32 +1277,15 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                 await db.commit()
                 return
 
-            # Refresh the access token if it has expired
-            if not await trakt_client.validate_token(settings.trakt_client_id, settings.trakt_access_token):
-                if settings.trakt_refresh_token and settings.trakt_client_secret:
-                    try:
-                        token_data = await trakt_client.refresh_access_token(
-                            settings.trakt_client_id,
-                            settings.trakt_client_secret,
-                            settings.trakt_refresh_token,
-                        )
-                        settings.trakt_access_token = token_data["access_token"]
-                        settings.trakt_refresh_token = token_data["refresh_token"]
-                        settings.trakt_token_expires_at = token_data.get("expires_in", 0) + int(datetime.now(timezone.utc).timestamp())
-                        await db.commit()
-                    except Exception as exc:
-                        err = f"Trakt token expired and refresh failed: {exc}"
-                        await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.failed, error_message=err))
-                        await db.commit()
-                        return
-                else:
-                    err = "Trakt token expired. Please reconnect Trakt in Settings."
-                    await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.failed, error_message=err))
-                    await db.commit()
-                    return
+            # Validate / refresh the access token (see ensure_valid_trakt_token).
+            try:
+                access_token = await ensure_valid_trakt_token(db, settings)
+            except TraktTokenError as exc:
+                await db.execute(update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.failed, error_message=_short_error(exc)))
+                await db.commit()
+                return
 
             client_id = settings.trakt_client_id
-            access_token = settings.trakt_access_token
             _gs_result = await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))
             _gs = _gs_result.scalar_one_or_none()
             api_key = settings.tmdb_api_key or (_gs.tmdb_api_key if _gs else None)
@@ -1129,10 +1306,17 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
                 getattr(settings, "trakt_watchlist_split", False),
                 history_start,
                 history_end,
+                dedup_window_from_settings(settings),
             )
 
             if settings.trakt_sync_watched and not history_had_errors:
                 settings.trakt_history_cursor_at = history_end
+
+            await _sync_trakt_watchlist(db, user_id, settings, client_id, access_token, api_key, stats)
+
+            if settings.trakt_sync_dropped:
+                dropped_items = await trakt_client.get_dropped_shows(client_id, access_token)
+                stats["dropped"] = await _apply_dropped_shows_import(db, user_id, dropped_items)
 
             print(_trakt_import_summary(job_id, "sync", stats))
             # A pull only populates scrob's own data — it never automatically pushes to
@@ -1157,7 +1341,7 @@ async def run_trakt_sync(user_id: int, job_id: int, full_resync: bool = False):
             print(f"Trakt sync job {job_id} failed: {exc}")
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
-                    status=SyncStatus.failed, error_message=str(exc)
+                    status=SyncStatus.failed, error_message=_short_error(exc)
                 )
             )
             await db.commit()
@@ -1225,7 +1409,7 @@ async def _apply_trakt_comments_import(
                 episode_number=episode_number,
                 content=content,
                 is_spoiler=bool(comment.get("spoiler")),
-                created_at=_parse_trakt_datetime(comment.get("created_at")) or datetime.utcnow(),
+                created_at=_parse_trakt_datetime(comment.get("created_at")) or utcnow(),
             ))
             existing_keys.add(key)
             stats["comments"] = stats.get("comments", 0) + 1
@@ -1241,7 +1425,7 @@ async def run_trakt_export_sync(
     sync_lists: bool = True,
     sync_comments: bool = True,
 ):
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     print(f"Starting Trakt export import for user {user_id}, job {job_id}")
     async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with async_session() as db:
@@ -1282,6 +1466,7 @@ async def run_trakt_export_sync(
                 getattr(settings, "trakt_watchlist_split", False),
                 None,
                 history_end,
+                dedup_window_from_settings(settings),
             )
 
             if sync_comments:
@@ -1311,7 +1496,7 @@ async def run_trakt_export_sync(
             print(f"Trakt export import job {job_id} failed: {exc}")
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
-                    status=SyncStatus.failed, error_message=str(exc)
+                    status=SyncStatus.failed, error_message=_short_error(exc)
                 )
             )
             await db.commit()
@@ -1347,6 +1532,72 @@ async def sync_trakt(
     background_tasks.add_task(run_trakt_sync, current_user.id, job.id, full)
     mode = "full resync" if full else "incremental sync"
     return {"status": "started", "job_id": job.id, "message": f"Trakt {mode} is running in the background"}
+
+
+@router.get("/comments")
+async def get_trakt_comments(
+    media_type: str = Query(...),
+    tmdb_id: int | None = Query(default=None),
+    tvdb_id: int | None = Query(default=None),
+    season_number: int | None = Query(default=None),
+    episode_number: int | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    sort: str = Query(default="likes"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Trakt's own public community comments for a movie/show/season/episode -
+    not the user's own comments (see models/comments.py's Comment for those).
+    Gated behind the per-user trakt_show_comments toggle (#434) - Trakt is
+    the only source of these, so there's no point resolving anything when
+    the user hasn't opted in, or hasn't connected Trakt at all.
+    """
+    if media_type not in ("movie", "show"):
+        raise HTTPException(status_code=422, detail="media_type must be 'movie' or 'show'")
+
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
+    settings = result.scalar_one_or_none()
+    if not settings or not settings.trakt_show_comments or not settings.trakt_client_id:
+        return {"enabled": False, "resolved": False, "comments": []}
+
+    client_id = settings.trakt_client_id
+    trakt_id: str | None = None
+
+    try:
+        if media_type == "movie":
+            if tmdb_id:
+                media_result = await db.execute(
+                    select(Media.imdb_id).where(Media.media_type == MediaType.movie, Media.tmdb_id == tmdb_id)
+                )
+                imdb_id = media_result.scalar_one_or_none()
+                trakt_id = imdb_id or await trakt_client.resolve_trakt_id(client_id, "tmdb", tmdb_id, "movie")
+        else:
+            if tmdb_id:
+                trakt_id = await trakt_client.resolve_trakt_id(client_id, "tmdb", tmdb_id, "show")
+            if not trakt_id and tvdb_id:
+                trakt_id = await trakt_client.resolve_trakt_id(client_id, "tvdb", tvdb_id, "show")
+
+        if not trakt_id:
+            return {"enabled": True, "resolved": False, "comments": []}
+
+        if season_number is not None and episode_number is not None:
+            comments = await trakt_client.get_episode_comments(client_id, trakt_id, season_number, episode_number, sort=sort, page=page)
+        elif season_number is not None:
+            comments = await trakt_client.get_season_comments(client_id, trakt_id, season_number, sort=sort, page=page)
+        elif media_type == "movie":
+            comments = await trakt_client.get_movie_comments(client_id, trakt_id, sort=sort, page=page)
+        else:
+            comments = await trakt_client.get_show_comments(client_id, trakt_id, sort=sort, page=page)
+    except Exception:
+        logger.exception("Failed to fetch Trakt comments for user %s (%s, tmdb=%s)", current_user.id, media_type, tmdb_id)
+        return {"enabled": True, "resolved": bool(trakt_id), "comments": []}
+
+    return {
+        "enabled": True,
+        "resolved": True,
+        "comments": comments,
+        "trakt_url": f"https://trakt.tv/{media_type}s/{trakt_id}",
+    }
 
 
 @router.post("/import/upload")
@@ -1416,7 +1667,7 @@ async def trakt_import_upload(
 
 
 async def _run_trakt_push(user_id: int, job_id: int) -> None:
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with async_session() as db:
         try:
@@ -1429,11 +1680,17 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                 select(UserSettings).where(UserSettings.user_id == user_id)
             )
             settings = settings_result.scalar_one_or_none()
-            if not settings or not settings.trakt_access_token or not settings.trakt_client_id:
+            # Validate / refresh the token before pushing. Skipping this is what
+            # made scheduled pushes 401-loop for days every 7 days (#326); the
+            # helper mutates settings.trakt_access_token in place on refresh, so
+            # the token reads further down pick up the new one automatically.
+            try:
+                await ensure_valid_trakt_token(db, settings)
+            except TraktTokenError as exc:
                 await db.execute(
                     update(SyncJob)
                     .where(SyncJob.id == job_id)
-                    .values(status=SyncStatus.failed, error_message="Trakt is not connected")
+                    .values(status=SyncStatus.failed, error_message=_short_error(exc))
                 )
                 await db.commit()
                 return
@@ -1442,6 +1699,27 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
             watch_events: list[tuple[int, datetime]] = []
             collected_ids: set[int] = set()
             ratings_map: RatingChanges = {}
+
+            # Dropped shows Trakt's hidden/dropped list is missing. The one-shot
+            # push at drop time (_push_show_dropped_to_providers) is best-effort;
+            # if it failed at a bad moment nothing else ever retried it (#329).
+            dropped_to_push: list[int] = []
+            if settings.trakt_push_dropped:
+                try:
+                    local_dropped = await _local_dropped_show_tmdb_ids(
+                        db, settings, watched_by_user_id=user_id
+                    )
+                    if local_dropped:
+                        remote_dropped = await trakt_client.get_dropped_shows(
+                            settings.trakt_client_id, settings.trakt_access_token
+                        )
+                        remote_tmdb = {
+                            (it.get("show") or {}).get("ids", {}).get("tmdb") for it in remote_dropped
+                        }
+                        remote_tmdb.discard(None)
+                        dropped_to_push = sorted(local_dropped - remote_tmdb)
+                except Exception as exc:
+                    logger.warning("Trakt push job %s: could not reconcile dropped shows: %s", job_id, exc)
 
             if settings.trakt_push_watched:
                 watched_result = await db.execute(
@@ -1475,7 +1753,7 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                 }
                 all_media_ids |= {media_id for media_id, _ in ratings_map}
 
-            if not all_media_ids:
+            if not all_media_ids and not dropped_to_push:
                 await db.execute(
                     update(SyncJob)
                     .where(SyncJob.id == job_id)
@@ -1500,6 +1778,8 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
 
             push_tasks: list[tuple[str, int, "Coroutine"]] = []
             watched_already_present = 0
+            ratings_already_present = 0
+            collection_already_present = 0
 
             if settings.trakt_push_watched:
                 movie_candidates: list[tuple[tuple, int, datetime]] = []
@@ -1567,17 +1847,20 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                             end_at=dedup_end_at,
                         ),
                     )
-                    remote_keys = _remote_history_keys(remote_movies, remote_episodes)
-                    watched_already_present = len(local_keys & remote_keys)
+                    remote_times = _remote_history_times(remote_movies, remote_episodes)
+                    watched_already_present = sum(
+                        1 for key in local_keys
+                        if _history_play_seen(remote_times, key[:-1], key[-1])
+                    )
                     pending: list[tuple[str, tuple]] = [
                         ("movie", (tmdb_id, watched_at))
                         for key, tmdb_id, watched_at in movie_candidates
-                        if key not in remote_keys
+                        if not _history_play_seen(remote_times, key[:-1], key[-1])
                     ]
                     pending.extend(
                         ("episode", (show_tmdb_id, season, episode_number, watched_at))
                         for key, show_tmdb_id, season, episode_number, watched_at in episode_candidates
-                        if key not in remote_keys
+                        if not _history_play_seen(remote_times, key[:-1], key[-1])
                     )
 
                     for index in range(0, len(pending), TRAKT_HISTORY_PUSH_BATCH_SIZE):
@@ -1596,6 +1879,23 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                         ))
 
             if settings.trakt_push_collection:
+                # Dedup against what Trakt already has - otherwise the entire
+                # library (often tens of thousands of episodes) is re-POSTed on
+                # every scheduled push, burning the write quota that real-time
+                # scrobbles share (#327). A failed fetch just means no dedup this
+                # run: still correct, Trakt no-ops the duplicates.
+                remote_collection_keys: set[tuple] = set()
+                try:
+                    remote_collection_keys = _remote_collection_keys(
+                        await trakt_client.get_collection(
+                            settings.trakt_client_id, settings.trakt_access_token
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Trakt push job %s: could not fetch remote collection: %s", job_id, exc
+                    )
+
                 collection_movies: list[int] = []
                 collection_episodes: list[tuple[int, int, int]] = []
                 for media_id in collected_ids:
@@ -1603,6 +1903,9 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                     if not media:
                         continue
                     if media.media_type == MediaType.movie and media.tmdb_id:
+                        if ("movie", media.tmdb_id) in remote_collection_keys:
+                            collection_already_present += 1
+                            continue
                         collection_movies.append(media.tmdb_id)
                     elif (
                         media.media_type == MediaType.episode
@@ -1613,6 +1916,11 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                     ):
                         show = shows_by_id.get(media.show_id)
                         if show and show.tmdb_id:
+                            if (
+                                "episode", show.tmdb_id, media.season_number, media.episode_number
+                            ) in remote_collection_keys:
+                                collection_already_present += 1
+                                continue
                             collection_episodes.append((
                                 show.tmdb_id,
                                 media.season_number,
@@ -1631,7 +1939,7 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                         ),
                     ))
 
-            if settings.trakt_push_ratings:
+            if settings.trakt_push_ratings and ratings_map:
                 from routers.sync import _get_effective_tmdb_key, _resolve_tmdb_season_ids
 
                 season_tmdb_ids = await _resolve_tmdb_season_ids(
@@ -1639,60 +1947,107 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                     set(ratings_map),
                     await _get_effective_tmdb_key(db, settings),
                 )
+
+                # Dedup against what Trakt already has, keyed by (kind, tmdb id,
+                # season number, rounded rating) - so a steady-state push sends
+                # nothing instead of re-POSTing every rating hourly (#327).
+                remote_rating_keys: set[tuple] = set()
+                try:
+                    remote_ratings = await trakt_client.get_ratings(
+                        settings.trakt_client_id, settings.trakt_access_token
+                    )
+                    for it in remote_ratings.get("movies", []):
+                        tid = ((it.get("movie") or {}).get("ids") or {}).get("tmdb")
+                        if tid is not None:
+                            remote_rating_keys.add(("movie", tid, None, int(it["rating"])))
+                    for it in remote_ratings.get("shows", []):
+                        tid = ((it.get("show") or {}).get("ids") or {}).get("tmdb")
+                        if tid is not None:
+                            remote_rating_keys.add(("show", tid, None, int(it["rating"])))
+                    for it in remote_ratings.get("seasons", []):
+                        show_tid = ((it.get("show") or {}).get("ids") or {}).get("tmdb")
+                        snum = (it.get("season") or {}).get("number")
+                        if show_tid is not None and snum is not None:
+                            remote_rating_keys.add(("season", show_tid, snum, int(it["rating"])))
+                except Exception as exc:
+                    # No dedup this run - still safe, just re-sends (batched).
+                    logger.warning("Trakt push job %s: could not fetch remote ratings: %s", job_id, exc)
+
+                movie_ratings: list[tuple[int, float]] = []
+                show_ratings: list[tuple[int, float]] = []
+                season_ratings: list[tuple[int, float]] = []
                 for key, rating in ratings_map.items():
                     media_id, season_number = key
                     media = media_by_id.get(media_id)
                     if not media or not media.tmdb_id:
                         continue
+                    rounded = max(1, min(10, round(rating)))
                     if season_number is not None:
-                        if season_tmdb_id := season_tmdb_ids.get(key):
-                            push_tasks.append((
-                                "ratings",
-                                1,
-                                trakt_client.set_season_rating(
-                                    settings.trakt_client_id,
-                                    settings.trakt_access_token,
-                                    season_tmdb_id,
-                                    rating,
-                                ),
-                            ))
+                        season_tmdb_id = season_tmdb_ids.get(key)
+                        if not season_tmdb_id:
+                            continue
+                        if ("season", media.tmdb_id, season_number, rounded) in remote_rating_keys:
+                            ratings_already_present += 1
+                            continue
+                        season_ratings.append((season_tmdb_id, rating))
                     elif media.media_type == MediaType.movie:
-                        push_tasks.append((
-                            "ratings",
-                            1,
-                            trakt_client.set_movie_rating(
-                                settings.trakt_client_id,
-                                settings.trakt_access_token,
-                                media.tmdb_id,
-                                rating,
-                            ),
-                        ))
+                        if ("movie", media.tmdb_id, None, rounded) in remote_rating_keys:
+                            ratings_already_present += 1
+                            continue
+                        movie_ratings.append((media.tmdb_id, rating))
                     elif media.media_type == MediaType.series:
-                        push_tasks.append((
-                            "ratings",
-                            1,
-                            trakt_client.set_show_rating(
-                                settings.trakt_client_id,
-                                settings.trakt_access_token,
-                                media.tmdb_id,
-                                rating,
-                            ),
-                        ))
+                        if ("show", media.tmdb_id, None, rounded) in remote_rating_keys:
+                            ratings_already_present += 1
+                            continue
+                        show_ratings.append((media.tmdb_id, rating))
+
+                # One /sync/ratings POST per chunk (arrays of movies/shows/
+                # seasons), not one per rating.
+                pending_ratings: list[tuple[str, tuple]] = (
+                    [("movie", p) for p in movie_ratings]
+                    + [("show", p) for p in show_ratings]
+                    + [("season", p) for p in season_ratings]
+                )
+                for index in range(0, len(pending_ratings), TRAKT_RATINGS_PUSH_BATCH_SIZE):
+                    chunk = pending_ratings[index:index + TRAKT_RATINGS_PUSH_BATCH_SIZE]
+                    push_tasks.append((
+                        "ratings",
+                        len(chunk),
+                        trakt_client.set_ratings_batch(
+                            settings.trakt_client_id,
+                            settings.trakt_access_token,
+                            [p for k, p in chunk if k == "movie"],
+                            [p for k, p in chunk if k == "show"],
+                            [p for k, p in chunk if k == "season"],
+                        ),
+                    ))
+
+            if dropped_to_push:
+                push_tasks.append((
+                    "dropped",
+                    len(dropped_to_push),
+                    trakt_client.add_to_hidden_batch(
+                        settings.trakt_client_id, settings.trakt_access_token, "dropped", dropped_to_push,
+                    ),
+                ))
 
             total = sum(item_count for _, item_count, _ in push_tasks)
+            already_present = (
+                watched_already_present + ratings_already_present + collection_already_present
+            )
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(total_items=total)
             )
             await db.commit()
 
             if not push_tasks:
-                print(f"Trakt push job {job_id}: all watched events already exist remotely.")
+                print(f"Trakt push job {job_id}: nothing to push - everything already on Trakt.")
                 await db.execute(
                     update(SyncJob)
                     .where(SyncJob.id == job_id)
                     .values(
                         status=SyncStatus.completed,
-                        stats={"succeeded": 0, "failed": 0, "skipped": watched_already_present},
+                        stats={"succeeded": 0, "failed": 0, "skipped": already_present},
                         processed_items=0,
                     )
                 )
@@ -1705,31 +2060,27 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
             print(
                 f"Trakt push job {job_id}: queued "
                 + ", ".join(f"{count} {category}" for category, count in queued_counts.items())
-                + f" ({total} total, {watched_already_present} already present)."
+                + f" ({total} total, {already_present} already present)."
             )
 
-            request_batch_size = 50
+            # One request at a time, spaced by TRAKT_PUSH_REQUEST_GAP - Trakt's
+            # write limit is ~1/s and it's shared with real-time scrobbles (#327).
             succeeded = 0
             failed = 0
             succeeded_by_category: dict[str, int] = {}
             failed_by_category: dict[str, int] = {}
-            for index in range(0, len(push_tasks), request_batch_size):
-                batch = push_tasks[index:index + request_batch_size]
-                results = await asyncio.gather(
-                    *[task for _, _, task in batch],
-                    return_exceptions=True,
-                )
-                for (category, item_count, _), result in zip(batch, results):
-                    if isinstance(result, Exception):
-                        failed += item_count
-                        failed_by_category[category] = (
-                            failed_by_category.get(category, 0) + item_count
-                        )
-                    else:
-                        succeeded += item_count
-                        succeeded_by_category[category] = (
-                            succeeded_by_category.get(category, 0) + item_count
-                        )
+            for i, (category, item_count, task) in enumerate(push_tasks):
+                try:
+                    await task
+                    succeeded += item_count
+                    succeeded_by_category[category] = succeeded_by_category.get(category, 0) + item_count
+                except Exception as exc:
+                    logger.warning(
+                        "Trakt push job %s: a %s batch (%s items) failed: %s",
+                        job_id, category, item_count, exc,
+                    )
+                    failed += item_count
+                    failed_by_category[category] = failed_by_category.get(category, 0) + item_count
                 await db.execute(
                     update(SyncJob)
                     .where(SyncJob.id == job_id)
@@ -1737,6 +2088,8 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                 )
                 await db.commit()
                 await _raise_if_cancelled(db, job_id)
+                if i + 1 < len(push_tasks):
+                    await asyncio.sleep(TRAKT_PUSH_REQUEST_GAP)
             breakdown = ", ".join(
                 f"{category}: {succeeded_by_category.get(category, 0)} succeeded"
                 + (
@@ -1748,7 +2101,7 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
             )
             print(
                 f"Trakt push job {job_id} completed. {breakdown}. "
-                f"Total: {succeeded}/{total} succeeded, {watched_already_present} skipped."
+                f"Total: {succeeded}/{total} succeeded, {already_present} skipped."
             )
 
             await db.execute(
@@ -1759,7 +2112,7 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
                     stats={
                         "succeeded": succeeded,
                         "failed": failed,
-                        "skipped": watched_already_present,
+                        "skipped": already_present,
                     },
                     processed_items=succeeded + failed,
                 )
@@ -1780,7 +2133,7 @@ async def _run_trakt_push(user_id: int, job_id: int) -> None:
             await db.execute(
                 update(SyncJob)
                 .where(SyncJob.id == job_id)
-                .values(status=SyncStatus.failed, error_message=str(exc))
+                .values(status=SyncStatus.failed, error_message=_short_error(exc))
             )
             await db.commit()
 
@@ -1796,7 +2149,8 @@ async def push_trakt(
     _require_trakt_config(settings)
     if not settings or not settings.trakt_access_token:
         raise HTTPException(status_code=400, detail="Trakt is not connected")
-    if not settings.trakt_push_watched and not settings.trakt_push_ratings and not settings.trakt_push_collection:
+    if not (settings.trakt_push_watched or settings.trakt_push_ratings
+            or settings.trakt_push_collection or settings.trakt_push_dropped):
         raise HTTPException(status_code=400, detail="Enable 'Scrob → Trakt' push flags first")
     job = SyncJob(user_id=current_user.id, source=CollectionSource.trakt, status=SyncStatus.pending, job_type="push")
     db.add(job)

@@ -7,10 +7,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from db import engine, get_db
+from db import get_db
 from models import CollectionSource, Media, Show, SyncJob, SyncStatus, User, UserSettings, WatchEvent
 from routers.auth import get_current_user
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +18,14 @@ router = APIRouter()
 
 async def run_bingebase_push(user_id: int, job_id: int) -> None:
     """Push all historical watched events from Scrob DB to Bingebase Webhook URL."""
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     from routers.webhooks import _maybe_bingebase_scrobble
 
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with session_factory() as db:
+    from db import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
         processed_so_far = 0
         try:
+            await _raise_if_cancelled(db, job_id)
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running)
             )
@@ -134,66 +134,10 @@ async def run_bingebase_push(user_id: int, job_id: int) -> None:
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
                     status=SyncStatus.failed,
-                    error_message=str(exc),
+                    error_message=_short_error(exc),
                 )
             )
             await db.commit()
-
-
-async def run_bingebase_sync(user_id: int, job_id: int) -> None:
-    """Pull / sync watched status from Bingebase to Scrob (unsupported)."""
-    from routers.sync import SyncCancelled, _raise_if_cancelled
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with session_factory() as db:
-        try:
-            await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running)
-            )
-            await db.commit()
-
-            err_msg = "Bingebase is a push-only webhook integration. Pull sync is not supported."
-            logger.error("Bingebase sync job %s failed: %s", job_id, err_msg)
-            await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(
-                    status=SyncStatus.failed,
-                    processed_items=0,
-                    total_items=0,
-                    error_message=err_msg,
-                    stats={"synced": 0},
-                )
-            )
-            await db.commit()
-        except SyncCancelled:
-            logger.info("Bingebase sync job %s cancelled", job_id)
-            await db.rollback()
-            await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.cancelled)
-            )
-            await db.commit()
-        except Exception as exc:
-            logger.exception("Bingebase sync job %s failed", job_id)
-            await db.rollback()
-            await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(
-                    status=SyncStatus.failed,
-                    error_message=str(exc),
-                )
-            )
-            await db.commit()
-
-
-@router.post("/sync")
-async def sync_bingebase(
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Trigger a background pull sync from Bingebase (unsupported)."""
-    raise HTTPException(
-        status_code=400,
-        detail="Bingebase is a push-only webhook integration. Pulling watched history from Bingebase is not supported.",
-    )
 
 
 @router.post("/push")

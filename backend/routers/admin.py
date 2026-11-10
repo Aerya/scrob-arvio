@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, update
 
 from db import get_db, engine
 from models.users import User
+from models.profile import UserProfileData
 from models.global_settings import GlobalSettings
 from models.media import Media
 from models.collection import Collection
@@ -23,6 +24,7 @@ from dependencies import require_admin
 from core.url_validator import validate_service_url
 from core.backup import asyncpg_conn, restore_backup
 import schemas
+from core.timeutil import utcnow
 
 router = APIRouter()
 
@@ -45,6 +47,52 @@ async def get_global_settings(
     return await _get_or_create_global_settings(db)
 
 
+@router.post("/settings/test-mdblist")
+async def test_global_mdblist(
+    body: schemas.ApiKeyTestRequest,
+    response: Response,
+    _: User = Depends(require_admin),
+):
+    from core import mdblist
+
+    response.headers["Cache-Control"] = "no-store"
+    api_key = body.key.get_secret_value().strip()
+    if not api_key or not await mdblist.validate_api_key(api_key):
+        raise HTTPException(status_code=400, detail="Failed to connect to MDBList")
+    return {"status": "ok"}
+
+
+@router.post("/settings/test-tmdb")
+async def test_global_tmdb(
+    body: schemas.ApiKeyTestRequest,
+    response: Response,
+    _: User = Depends(require_admin),
+):
+    from core import tmdb
+
+    response.headers["Cache-Control"] = "no-store"
+    api_key = body.key.get_secret_value().strip()
+    if not api_key or not await tmdb.validate_api_key(api_key):
+        raise HTTPException(status_code=400, detail="Failed to connect to TMDB")
+    return {"status": "ok"}
+
+
+@router.post("/settings/test-tvdb")
+async def test_global_tvdb(
+    body: schemas.ApiKeyTestRequest,
+    response: Response,
+    _: User = Depends(require_admin),
+):
+    from core import tvdb
+
+    response.headers["Cache-Control"] = "no-store"
+    api_key = body.key.get_secret_value().strip()
+    pin = body.pin.get_secret_value().strip() if body.pin else None
+    if not api_key or not await tvdb.validate_api_key(api_key, pin=pin or None):
+        raise HTTPException(status_code=400, detail="Failed to connect to TVDB")
+    return {"status": "ok"}
+
+
 @router.patch("/settings", response_model=schemas.GlobalSettings)
 async def update_global_settings(
     body: schemas.GlobalSettings,
@@ -55,10 +103,32 @@ async def update_global_settings(
 
     update_data = body.model_dump(exclude_unset=True)
 
+    if "mdblist_api_key" in update_data and update_data["mdblist_api_key"]:
+        from core import mdblist
+
+        if not await mdblist.validate_api_key(update_data["mdblist_api_key"]):
+            raise HTTPException(status_code=400, detail="Invalid MDBList API key")
+
     url_fields = {"radarr_url": "Radarr URL", "sonarr_url": "Sonarr URL"}
     for field, label in url_fields.items():
         if field in update_data and update_data[field]:
             update_data[field] = await validate_service_url(update_data[field], label)
+
+    # NULL/empty is meaningful here (it means aired order, the historical
+    # behaviour), so only a value that is actually set gets validated. Stored
+    # normalised so every reader compares order keys.
+    if update_data.get("default_episode_order"):
+        from core.episode_order import validate_default_episode_order
+
+        try:
+            order_key = validate_default_episode_order(update_data["default_episode_order"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        update_data["default_episode_order"] = order_key
+        if order_key.startswith("tvdb:") and not (
+            update_data.get("tvdb_api_key") or gs.tvdb_api_key
+        ):
+            raise HTTPException(status_code=400, detail="TVDB API key not configured")
 
     for field, value in update_data.items():
         if hasattr(gs, field):
@@ -74,8 +144,73 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    result = await db.execute(select(User).order_by(User.created_at.asc()))
-    return result.scalars().all()
+    result = await db.execute(
+        select(User, UserProfileData)
+        .outerjoin(UserProfileData, UserProfileData.user_id == User.id)
+        .order_by(User.created_at.asc())
+    )
+    return [
+        schemas.AdminUser(
+            id=u.id,
+            username=u.username,
+            email=u.email,
+            is_admin=u.is_admin,
+            api_key=u.api_key,
+            created_at=u.created_at,
+            avatar_url=f"/profile/avatar/{u.id}" if (p and p.avatar_path) else None,
+            totp_enabled=u.totp_enabled,
+        )
+        for u, p in result.all()
+    ]
+
+
+@router.post("/users", response_model=schemas.AdminUser, status_code=status.HTTP_201_CREATED)
+async def create_user(
+    body: schemas.AdminUserCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Manually provision a user. Unlike self-registration this ignores the
+    ENABLE_REGISTRATIONS gate and marks the email confirmed - the admin is
+    vouching for the account - so the user can sign in right away."""
+    from core.security import get_password_hash
+    from models.base import UserRole
+    from routers.auth import _generate_api_key
+
+    username = body.username.strip()
+    email = body.email.strip().lower()
+
+    existing = await db.execute(
+        select(User).where((User.email == email) | (User.username == username))
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A user with this email or username already exists",
+        )
+
+    user = User(
+        username=username,
+        email=email,
+        password_hash=get_password_hash(body.password),
+        api_key=_generate_api_key(),
+        role=UserRole.admin if body.is_admin else UserRole.user,
+        is_admin=body.is_admin,
+        email_confirmed=True,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return schemas.AdminUser(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        is_admin=user.is_admin,
+        api_key=user.api_key,
+        created_at=user.created_at,
+        avatar_url=None,
+    )
 
 
 @router.patch("/users/{user_id}/toggle-admin", response_model=schemas.AdminUser)
@@ -104,6 +239,54 @@ async def toggle_admin(
     await db.commit()
     await db.refresh(target)
     return target
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(
+    user_id: int,
+    body: schemas.AdminPasswordReset,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Set a new password for any user - for instances without SMTP, where the
+    self-service forgot-password email flow isn't available (#445)."""
+    from core.security import get_password_hash
+    from models.password_reset import PasswordResetToken
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target.password_hash = get_password_hash(body.password)
+    # Any emailed reset link issued before this is now moot.
+    await db.execute(delete(PasswordResetToken).where(PasswordResetToken.user_id == user_id))
+    await db.commit()
+    return {"status": "password reset"}
+
+
+@router.post("/users/{user_id}/disable-2fa")
+async def disable_user_2fa(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Turn off two-factor auth for a user who lost their authenticator and
+    backup codes. The user can set it up again from their own settings."""
+    from models.users import TotpBackupCode
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not target.totp_enabled:
+        raise HTTPException(status_code=400, detail="2FA is not enabled for this user")
+
+    target.totp_enabled = False
+    target.totp_secret = None
+    await db.execute(delete(TotpBackupCode).where(TotpBackupCode.user_id == user_id))
+    await db.commit()
+    return {"status": "2FA disabled"}
 
 
 @router.delete("/users/{user_id}")
@@ -155,7 +338,7 @@ async def backup_database(_: User = Depends(require_admin)):
                 gz.write(data)
 
         payload = buf.getvalue()
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"scrob_backup_{timestamp}.bak"
         return Response(
             content=payload,
@@ -203,14 +386,23 @@ async def admin_heal_metadata(
     current_user: User = Depends(require_admin),
 ):
     """Re-enrich all collection items server-wide that are missing poster/date metadata."""
-    gs = await _get_or_create_global_settings(db)
-    if not gs.tmdb_api_key:
-        raise HTTPException(status_code=400, detail="A global TMDB API key is required for server-wide heal")
+    # TMDB metadata isn't user-specific, so resolve the key the same way every
+    # other TMDB path does: this admin's own key, then the global one (#336).
+    from routers.sync import _get_effective_tmdb_key
+
+    settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
+    settings = settings_result.scalar_one_or_none()
+    effective_key = await _get_effective_tmdb_key(db, settings)
+    if not effective_key:
+        raise HTTPException(
+            status_code=400,
+            detail="No TMDB Read Access Token is configured. Set one in Admin settings or in your account Settings.",
+        )
     job = SyncJob(user_id=current_user.id, source=CollectionSource.tmdb, job_type="heal", status=SyncStatus.pending)
     db.add(job)
     await db.commit()
     await db.refresh(job)
-    background_tasks.add_task(run_admin_heal, gs.tmdb_api_key, current_user.id, job.id)
+    background_tasks.add_task(run_admin_heal, effective_key, current_user.id, job.id)
     return {"status": "started", "message": "Server-wide metadata heal is running in the background"}
 
 
@@ -267,7 +459,7 @@ async def run_admin_heal(api_key: str, user_id: int | None = None, job_id: int |
             ]
 
             await _update_job(total_items=len(to_enrich), processed_items=0)
-            await batch_enrich_items(to_enrich, api_key=api_key)
+            await batch_enrich_items(db, to_enrich, api_key=api_key, user_id=user_id)
             await db.commit()
             await _update_job(processed_items=len(to_enrich), status=SyncStatus.completed, stats={"healed": True})
             print(f"Admin heal complete: processed {len(to_enrich)} items")

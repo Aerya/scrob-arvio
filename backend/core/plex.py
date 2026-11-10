@@ -1,7 +1,11 @@
+import asyncio
+import json
 import logging
+import re
+import time
 import httpx
 import xmltodict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 logger = logging.getLogger(__name__)
@@ -16,7 +20,19 @@ async def _get(url: str, token: str, params: Optional[Dict] = None) -> Dict:
         }
         res = await client.get(url, headers=headers, params=params)
         res.raise_for_status()
-        return res.json()
+        try:
+            return res.json()
+        except UnicodeDecodeError:
+            # Some Plex Media Server setups emit a genuinely non-UTF-8 byte
+            # somewhere in a scraped field (title/summary/etc, likely a
+            # mis-transcoded legacy agent result) despite claiming a JSON
+            # response - one bad byte anywhere in the payload used to fail
+            # decoding of the *entire* response, taking the whole request
+            # (e.g. an entire page of watch history) down with it (#388).
+            # Decode leniently instead: a mangled character in that one field
+            # beats losing every item the response actually carried.
+            logger.warning("Plex response from %s was not valid UTF-8 - decoding leniently", url)
+            return json.loads(res.content.decode("utf-8", errors="replace"))
 
 def get_guids(item: Dict) -> List[Dict]:
     """Return a normalised Guid list for a Plex item.
@@ -24,6 +40,7 @@ def get_guids(item: Dict) -> List[Dict]:
     Modern Plex returns a 'Guid' array: [{"id": "tmdb://123"}, ...].
     Legacy items may have an empty/missing 'Guid' but a single lowercase 'guid'
     string like 'com.plexapp.agents.thetvdb://73762/1/1'.
+    HAMA items have a guid string like 'com.plexapp.agents.hama://tvdb-73762/1/1'.
     """
     guids = item.get("Guid") or []
     if not guids:
@@ -33,42 +50,39 @@ def get_guids(item: Dict) -> List[Dict]:
     return guids
 
 
-def extract_tmdb_id(guids: List[Dict]) -> Optional[int]:
-    if not guids:
-        return None
-    for guid in guids:
-        id_str = guid.get("id", "")
-        for prefix in ("tmdb://", "com.plexapp.agents.themoviedb://"):
-            if id_str.startswith(prefix):
-                try:
-                    return int(id_str[len(prefix):].split("/")[0])
-                except ValueError:
-                    break
+# Plex exposes a source id in a Guid two ways:
+#   * the plain scheme - "tmdb://123", or the legacy agent form
+#     "com.plexapp.agents.themoviedb://123/1/1"
+#   * the HAMA / Absolute Series Scanner agent, which packs the real source
+#     behind its own scheme: "com.plexapp.agents.hama://tvdb-73762/1/1"
+#     (and "tvdb2-", "tvdb3-" ... for TheTVDB's alternate episode orders).
+# Anchoring each alternative on the "://" boundary keeps a stray "tmdb-123"
+# elsewhere in the string from being read as an id, and \d+ stops at the
+# season/episode path and any "?lang=" suffix on its own.
+_TMDB_GUID_RE = re.compile(r"(?:tmdb|themoviedb)://(\d+)|://tmdb-(\d+)")
+_TVDB_GUID_RE = re.compile(r"tvdb://(\d+)|://tvdb[2-9]?-(\d+)")
+_IMDB_GUID_RE = re.compile(r"imdb://(tt\d+)|://imdb-(tt\d+)")
+
+
+def _first_guid_match(guids: List[Dict], pattern: "re.Pattern[str]") -> Optional[str]:
+    for guid in guids or []:
+        match = pattern.search(guid.get("id", "") or "")
+        if match:
+            return next((g for g in match.groups() if g), None)
     return None
+
+
+def extract_tmdb_id(guids: List[Dict]) -> Optional[int]:
+    raw = _first_guid_match(guids, _TMDB_GUID_RE)
+    return int(raw) if raw is not None else None
 
 
 def extract_tvdb_id(guids: List[Dict]) -> Optional[str]:
-    if not guids:
-        return None
-    for guid in guids:
-        id_str = guid.get("id", "")
-        for prefix in ("tvdb://", "com.plexapp.agents.thetvdb://"):
-            if id_str.startswith(prefix):
-                val = id_str[len(prefix):].split("/")[0].strip()
-                return val if val else None
-    return None
+    return _first_guid_match(guids, _TVDB_GUID_RE)
 
 
 def extract_imdb_id(guids: List[Dict]) -> Optional[str]:
-    if not guids:
-        return None
-    for guid in guids:
-        id_str = guid.get("id", "")
-        for prefix in ("imdb://", "com.plexapp.agents.imdb://"):
-            if id_str.startswith(prefix):
-                val = id_str[len(prefix):].split("/")[0].strip()
-                return val if val else None
-    return None
+    return _first_guid_match(guids, _IMDB_GUID_RE)
 
 def extract_quality(media_list: List[Dict]) -> Dict:
     if not media_list:
@@ -152,19 +166,46 @@ async def get_item(url: str, token: str, rating_key: str) -> Optional[Dict]:
         return None
 
 
+# Plex has no working "find by external id" filter: /library/all?guid=tmdb://...
+# matches nothing on the modern agents (their own guid is plex://...), and
+# grandparentGuid / parentIndex are not queryable fields at all - parentIndex
+# makes the server answer HTTP 500 ("Invalid field for column"). Resolve items
+# through a tmdb_id -> ratingKey index of the libraries instead, built once and
+# reused for a few minutes so a full push is not one library scan per item.
+_INDEX_TTL = 300.0
+_index_cache: Dict[str, tuple] = {}
+_index_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def _get_tmdb_index(url: str, token: str) -> Dict[str, Dict[int, str]]:
+    """Return {"movie": {tmdb_id: ratingKey}, "show": {tmdb_id: ratingKey}} for every library."""
+    key = url.rstrip("/")
+    cached = _index_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _INDEX_TTL:
+        return cached[1]
+    async with _index_locks.setdefault(key, asyncio.Lock()):
+        cached = _index_cache.get(key)
+        if cached and time.monotonic() - cached[0] < _INDEX_TTL:
+            return cached[1]
+        index: Dict[str, Dict[int, str]] = {"movie": {}, "show": {}}
+        for lib in await get_libraries(url, token):
+            kind = lib.get("type")
+            if kind not in index:
+                continue
+            fetch = get_movies if kind == "movie" else get_shows
+            for item in await fetch(url, token, str(lib.get("key"))):
+                tmdb_id = extract_tmdb_id(get_guids(item))
+                if tmdb_id and item.get("ratingKey"):
+                    index[kind].setdefault(tmdb_id, str(item["ratingKey"]))
+        _index_cache[key] = (time.monotonic(), index)
+        return index
+
+
 async def find_movie_by_tmdb_id(url: str, token: str, tmdb_id: int) -> Optional[Dict]:
     """Search all Plex libraries for a movie by TMDB ID. Returns the item (with Media/Part detail) or None."""
     try:
-        data = await _get(
-            f"{url.rstrip('/')}/library/all",
-            token,
-            params={"type": 1, "guid": f"tmdb://{tmdb_id}", "includeGuids": 1},
-        )
-        items = data.get("MediaContainer", {}).get("Metadata", [])
-        if not items:
-            return None
-        # Fetch the full item with Media/Part/Stream detail
-        return await get_item(url, token, str(items[0]["ratingKey"]))
+        rating_key = (await _get_tmdb_index(url, token))["movie"].get(int(tmdb_id))
+        return await get_item(url, token, rating_key) if rating_key else None
     except Exception:
         return None
 
@@ -172,21 +213,17 @@ async def find_movie_by_tmdb_id(url: str, token: str, tmdb_id: int) -> Optional[
 async def find_episode_by_ids(url: str, token: str, series_tmdb_id: int, season: int, episode: int) -> Optional[Dict]:
     """Search all Plex libraries for an episode by series TMDB ID + season + episode number."""
     try:
-        # Try filtering by grandparent GUID and indexes (supported on modern Plex)
+        show_key = (await _get_tmdb_index(url, token))["show"].get(int(series_tmdb_id))
+        if not show_key:
+            return None
         data = await _get(
-            f"{url.rstrip('/')}/library/all",
+            f"{url.rstrip('/')}/library/metadata/{show_key}/allLeaves",
             token,
-            params={
-                "type": 4,
-                "grandparentGuid": f"tmdb://{series_tmdb_id}",
-                "parentIndex": season,
-                "index": episode,
-                "includeGuids": 1,
-            },
+            params={"includeGuids": 1},
         )
-        items = data.get("MediaContainer", {}).get("Metadata", [])
-        if items:
-            return await get_item(url, token, str(items[0]["ratingKey"]))
+        for item in data.get("MediaContainer", {}).get("Metadata", []):
+            if item.get("parentIndex") == season and item.get("index") == episode and item.get("ratingKey"):
+                return await get_item(url, token, str(item["ratingKey"]))
         return None
     except Exception:
         return None
@@ -209,27 +246,48 @@ async def get_libraries(url: str, token: str) -> List[Dict]:
     data = await _get(f"{url.rstrip('/')}/library/sections", token)
     return data.get("MediaContainer", {}).get("Directory", [])
 
+async def _get_library_items_paginated(url: str, token: str, section_id: str, params: Dict) -> List[Dict]:
+    """Fetch every item in a library section, paging with X-Plex-Container-
+    Start/-Size the same way get_watchlist/get_plex_history already do.
+
+    A single unpaginated request for a whole section used to time out on a
+    large TV library (tens of thousands of episodes in one response, #441) -
+    movies libraries are usually small enough that this went unnoticed. A
+    fixed page size keeps each request's latency predictable regardless of
+    how large the library grows.
+    """
+    page_size = 1000
+    items: List[Dict] = []
+    start = 0
+    while True:
+        data = await _get(
+            f"{url.rstrip('/')}/library/sections/{section_id}/all",
+            token,
+            params={**params, "X-Plex-Container-Start": start, "X-Plex-Container-Size": page_size},
+        )
+        container = data.get("MediaContainer", {})
+        batch = container.get("Metadata", [])
+        items.extend(batch)
+        total = container.get("totalSize", 0) or len(items)
+        start += len(batch)
+        if not batch or start >= total:
+            break
+    return items
+
+
 async def get_movies(url: str, token: str, section_id: str) -> List[Dict]:
-    params = {"includeGuids": 1}
-    data = await _get(f"{url.rstrip('/')}/library/sections/{section_id}/all", token, params=params)
-    return data.get("MediaContainer", {}).get("Metadata", [])
+    return await _get_library_items_paginated(url, token, section_id, {"includeGuids": 1})
 
 async def get_shows(url: str, token: str, section_id: str) -> List[Dict]:
-    params = {"includeGuids": 1}
-    data = await _get(f"{url.rstrip('/')}/library/sections/{section_id}/all", token, params=params)
-    return data.get("MediaContainer", {}).get("Metadata", [])
+    return await _get_library_items_paginated(url, token, section_id, {"includeGuids": 1})
 
 async def get_seasons(url: str, token: str, section_id: str) -> List[Dict]:
     """Fetch season metadata, including user ratings, from a TV library."""
-    params = {"type": 3, "includeGuids": 1}
-    data = await _get(f"{url.rstrip('/')}/library/sections/{section_id}/all", token, params=params)
-    return data.get("MediaContainer", {}).get("Metadata", [])
+    return await _get_library_items_paginated(url, token, section_id, {"type": 3, "includeGuids": 1})
 
 
 async def get_episodes(url: str, token: str, section_id: str) -> List[Dict]:
-    params = {"type": 4, "includeGuids": 1}
-    data = await _get(f"{url.rstrip('/')}/library/sections/{section_id}/all", token, params=params)
-    return data.get("MediaContainer", {}).get("Metadata", [])
+    return await _get_library_items_paginated(url, token, section_id, {"type": 4, "includeGuids": 1})
 
 async def get_recently_added(url: str, token: str, section_id: str, media_type: int, limit: int = 50) -> List[Dict]:
     """Fetch the most recently-added items from a library section.
@@ -262,6 +320,12 @@ async def get_history(url: str, token: str, since: Optional[datetime] = None) ->
     start = 0
     params: Dict = {"sort": "viewedAt:asc"}
     if since is not None:
+        # The cursor is stored as naive UTC; .timestamp() on a naive datetime
+        # interprets it as *local* time, shifting the window by the host's UTC
+        # offset. West of UTC that starts the fetch hours too late, and since
+        # the cursor still advances, those plays are then skipped forever (#126).
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
         params["viewedAt>"] = int(since.timestamp())
     try:
         while True:
@@ -277,10 +341,15 @@ async def get_history(url: str, token: str, since: Optional[datetime] = None) ->
             start += len(batch)
             if not batch or start >= total:
                 break
-        return items
     except Exception:
-        logger.warning("Could not fetch Plex play history from %s", url)
-        return []
+        # Whatever pages already succeeded are still worth keeping - losing
+        # every prior page over one later failure (#388) meant a single bad
+        # page silently discarded an entire account's watch history instead
+        # of importing everything up to that point. The next sync's full
+        # re-scan (see _backfill_plex_watch_history) still dedupes safely
+        # against whatever this run did manage to save.
+        logger.warning("Could not fetch all Plex play history from %s (got %d item(s) before failing)", url, len(items))
+    return items
 
 
 async def get_account_id(url: str, token: str, username: str) -> Optional[int]:
@@ -302,7 +371,205 @@ async def get_account_id(url: str, token: str, username: str) -> Optional[int]:
 METADATA_BASE = "https://metadata.provider.plex.tv"
 DISCOVER_BASE = "https://discover.provider.plex.tv"
 PLEX_TV_BASE  = "https://plex.tv"
+APP_AUTH_BASE = "https://app.plex.tv/auth"
 COMMUNITY_BASE = "https://community.plex.tv"
+
+
+# ── plex.tv account auth (PIN / "Login with Plex") ─────────────────────────────
+
+def _plextv_headers(client_id: str, token: Optional[str] = None) -> Dict:
+    headers = {
+        "Accept": "application/json",
+        "X-Plex-Product": "Scrob",
+        "X-Plex-Version": "1.0",
+        "X-Plex-Client-Identifier": client_id,
+        "X-Plex-Device": "Scrob",
+        "X-Plex-Device-Name": "Scrob",
+        "X-Plex-Platform": "Web",
+    }
+    if token:
+        headers["X-Plex-Token"] = token
+    return headers
+
+
+async def create_auth_pin(client_id: str) -> Dict:
+    """Create a plex.tv auth PIN. Returns {id, code}.
+
+    The user then visits build_auth_url(client_id, code) and signs in; once they
+    do, poll_auth_pin() returns the account auth token.
+    """
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+        res = await client.post(
+            f"{PLEX_TV_BASE}/api/v2/pins",
+            headers=_plextv_headers(client_id),
+            params={"strong": "true"},
+        )
+        res.raise_for_status()
+        data = res.json()
+        return {"id": data["id"], "code": data["code"]}
+
+
+async def poll_auth_pin(client_id: str, pin_id: int) -> Optional[str]:
+    """Return the account auth token once the PIN has been claimed, else None."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+        res = await client.get(
+            f"{PLEX_TV_BASE}/api/v2/pins/{pin_id}",
+            headers=_plextv_headers(client_id),
+        )
+        res.raise_for_status()
+        return res.json().get("authToken") or None
+
+
+def build_auth_url(client_id: str, code: str) -> str:
+    """The app.plex.tv URL the user opens to authorize the PIN."""
+    from urllib.parse import urlencode
+
+    params = {
+        "clientID": client_id,
+        "code": code,
+        "context[device][product]": "Scrob",
+        "context[device][device]": "Scrob",
+        "context[device][platform]": "Web",
+    }
+    return f"{APP_AUTH_BASE}#?{urlencode(params)}"
+
+
+async def get_account(client_id: str, token: str) -> Optional[Dict]:
+    """Fetch the signed-in plex.tv account. Returns {id, username, title, email}."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+            res = await client.get(
+                f"{PLEX_TV_BASE}/api/v2/user",
+                headers=_plextv_headers(client_id, token),
+            )
+            if res.status_code >= 400:
+                return None
+            d = res.json()
+        return {
+            "id": str(d.get("id") or ""),
+            "username": d.get("username") or d.get("title") or "",
+            "title": d.get("title") or "",
+            "email": d.get("email") or "",
+        }
+    except Exception:
+        return None
+
+
+async def get_servers(client_id: str, token: str) -> List[Dict]:
+    """List the Plex Media Servers this account can reach.
+
+    Each entry: {name, machine_identifier, owned, access_token, connections:
+    [{uri, local, relay, protocol}]}. The per-server access_token is scoped to
+    that server and is what belongs in MediaServerConnection.token.
+    """
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
+        res = await client.get(
+            f"{PLEX_TV_BASE}/api/v2/resources",
+            headers=_plextv_headers(client_id, token),
+            params={"includeHttps": 1, "includeRelay": 1},
+        )
+        res.raise_for_status()
+        resources = res.json()
+
+    servers: List[Dict] = []
+    for r in resources:
+        provides = (r.get("provides") or "").split(",")
+        if "server" not in provides:
+            continue
+        conns = [
+            {
+                "uri": c.get("uri"),
+                "local": bool(c.get("local")),
+                "relay": bool(c.get("relay")),
+                "protocol": c.get("protocol"),
+            }
+            for c in (r.get("connections") or [])
+            if c.get("uri")
+        ]
+        servers.append({
+            "name": r.get("name") or "Plex Server",
+            "machine_identifier": r.get("clientIdentifier") or "",
+            "owned": bool(r.get("owned")),
+            "access_token": r.get("accessToken") or token,
+            "connections": conns,
+        })
+    return servers
+
+
+def _connection_rank(conn: Dict) -> int:
+    if conn.get("relay"):
+        return 2
+    if conn.get("local"):
+        return 0
+    return 1
+
+
+def connection_label(conn: Dict) -> str:
+    """Human label for a Plex connection URI, e.g. 'Local · https://10-0-0-2.plex.direct:32400'."""
+    if conn.get("relay"):
+        kind = "Relay"
+    elif conn.get("local"):
+        kind = "Local"
+    else:
+        kind = "Remote"
+    return f"{kind} · {conn.get('uri', '')}"
+
+
+async def _probe_connection(client: httpx.AsyncClient, uri: str, token: str, want_mid: Optional[str]) -> bool:
+    try:
+        r = await client.get(
+            f"{uri.rstrip('/')}/identity",
+            headers={"X-Plex-Token": token, "Accept": "application/json"},
+        )
+        if r.status_code != 200:
+            return False
+        got = r.json().get("MediaContainer", {}).get("machineIdentifier")
+        return not want_mid or got == want_mid
+    except Exception:
+        return False
+
+
+async def resolve_connections(server: Dict) -> Dict:
+    """Probe every advertised connection for a server and return them all, ordered
+    local → remote → relay, each tagged with a `reachable` flag and a display
+    `label`. `recommended` is the first reachable URI, or the best-ranked one if
+    none respond (the user can still pick another or edit the field).
+
+    URIs that resolve to a blocked (cloud-metadata) range are dropped entirely -
+    a Plex server can advertise arbitrary custom-access URLs and the backend
+    fetches these, so they go through the same SSRF filter as manual entry."""
+    from core.url_validator import is_safe_service_url
+
+    candidates = sorted(server.get("connections") or [], key=_connection_rank)
+    ordered = [
+        c for c in candidates
+        if c.get("uri") and await is_safe_service_url(c["uri"])
+    ]
+    if not ordered:
+        return {"recommended": None, "connections": []}
+
+    want_mid = server.get("machine_identifier")
+    token = server.get("access_token")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(4.0), follow_redirects=False) as client:
+        flags = await asyncio.gather(
+            *(_probe_connection(client, c["uri"], token, want_mid) for c in ordered)
+        )
+
+    conns = [
+        {
+            "uri": c["uri"],
+            "local": c["local"],
+            "relay": c["relay"],
+            "protocol": c.get("protocol"),
+            "reachable": bool(ok),
+            "label": connection_label(c),
+        }
+        for c, ok in zip(ordered, flags)
+    ]
+    recommended = next((c["uri"] for c in conns if c["reachable"]), conns[0]["uri"])
+    return {"recommended": recommended, "connections": conns}
+
+
 _CLOUD_HEADERS = {
     "Accept": "application/json",
     "X-Plex-Product": "Scrob",
@@ -484,24 +751,11 @@ async def resolve_season_rating_key(
 ) -> str | None:
     """Resolve a local Plex season ratingKey from a TMDB show ID and season number."""
     try:
-        data = await _get(
-            f"{url.rstrip('/')}/library/sections/all",
-            token,
-            params={"type": 2, "guid": f"tmdb://{show_tmdb_id}", "includeGuids": 1},
-        )
-        shows = data.get("MediaContainer", {}).get("Metadata", [])
-        show = next(
-            (
-                item
-                for item in shows
-                if extract_tmdb_id(get_guids(item)) == show_tmdb_id
-            ),
-            None,
-        )
-        if not show or not show.get("ratingKey"):
+        show_key = (await _get_tmdb_index(url, token))["show"].get(int(show_tmdb_id))
+        if not show_key:
             return None
         children = await _get(
-            f"{url.rstrip('/')}/library/metadata/{show['ratingKey']}/children",
+            f"{url.rstrip('/')}/library/metadata/{show_key}/children",
             token,
         )
         seasons = children.get("MediaContainer", {}).get("Metadata", [])
@@ -582,6 +836,37 @@ async def mark_watched(url: str, token: str, rating_key: str, client: httpx.Asyn
             return r.status_code < 400
         async with httpx.AsyncClient(timeout=PUSH_TIMEOUT, follow_redirects=False) as c:
             r = await c.get(f"{url.rstrip('/')}/:/scrobble", headers=headers, params=params)
+            return r.status_code < 400
+    except Exception:
+        return False
+
+async def set_progress(
+    url: str,
+    token: str,
+    rating_key: str,
+    position_ms: int,
+    client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Set the resume point of a Plex item, so it shows as partly watched and
+    lands in Continue Watching.
+
+    /:/progress writes the account's viewOffset directly, the same call Plex's
+    own clients make when they save a position. It is not a playback report
+    the way /:/timeline is, so it does not start a session in Now Playing.
+    """
+    headers = {"X-Plex-Token": token, "Accept": "application/json"}
+    params = {
+        "key": rating_key,
+        "identifier": "com.plexapp.plugins.library",
+        "time": str(max(int(position_ms), 0)),
+        "state": "stopped",
+    }
+    try:
+        if client:
+            r = await client.get(f"{url.rstrip('/')}/:/progress", headers=headers, params=params)
+            return r.status_code < 400
+        async with httpx.AsyncClient(timeout=PUSH_TIMEOUT, follow_redirects=False) as c:
+            r = await c.get(f"{url.rstrip('/')}/:/progress", headers=headers, params=params)
             return r.status_code < 400
     except Exception:
         return False
