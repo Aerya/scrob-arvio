@@ -1,7 +1,12 @@
-from pydantic import BaseModel, EmailStr, SecretStr, field_validator, model_validator
+import re
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator, ConfigDict
+import re
 from typing import Optional
 from datetime import datetime
 from models.base import UserRole, MediaType, PrivacyLevel
+
+# Shape of a BCP 47 language tag ("fr", "pt-BR"); see validate_ui_language.
+UI_LANGUAGE_TAG = re.compile(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*")
 
 class UserBase(BaseModel):
     email: EmailStr
@@ -12,6 +17,16 @@ class UserCreate(UserBase):
     password: str
 
 class User(UserBase):
+    # Overrides UserBase's EmailStr - this is a response model, serializing
+    # an email address already stored in the DB, not validating one being
+    # submitted. OIDC auto-provisioning (routers/oidc.py) stores whatever the
+    # identity provider's claim contains with no format check at all (it's
+    # trusting an already-authenticated external identity, not collecting a
+    # deliverable address) - a self-hosted IdP on a reserved-use domain like
+    # .home.arpa is enough to fail EmailStr, which used to break every
+    # /auth/me call for that user - i.e. lock them out of the app entirely
+    # right after a successful login (#293).
+    email: str
     id: int
     api_key: str
     display_name: str
@@ -21,8 +36,7 @@ class User(UserBase):
     has_password: bool = True
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class UserLogin(BaseModel):
     username: str
@@ -39,9 +53,48 @@ class Token(BaseModel):
     token_type: str = "bearer"
     requires_2fa: bool = False
     temp_token: Optional[str] = None
+    # Seconds the access token is valid for, so the frontend can size the cookie.
+    expires_in: Optional[int] = None
 
 class TokenPayload(BaseModel):
     sub: Optional[int] = None
+
+
+# --- OAuth 2.0 Device Authorization Grant (RFC 8628), #331 ---
+
+class DeviceCodeRequest(BaseModel):
+    client_name: Optional[str] = None
+    scope: Optional[str] = None
+
+class DeviceCodeResponse(BaseModel):
+    device_code: str
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str
+    expires_in: int
+    interval: int
+
+class DeviceApproveRequest(BaseModel):
+    user_code: str
+    action: str  # "approve" | "deny"
+    # Optional user-chosen label, set on the approval screen; falls back to the
+    # name the client sent with /device/code.
+    name: Optional[str] = None
+
+class DevicePendingResponse(BaseModel):
+    client_name: str
+    scope: str
+    requested_at: datetime
+
+class DeviceGrantItem(BaseModel):
+    id: int
+    client_name: str
+    scope: str
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 class TotpSetupResponse(BaseModel):
     provisioning_uri: str
@@ -63,19 +116,21 @@ class TotpBackupCodeItem(BaseModel):
     code: str
     used: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class TotpBackupCodesResponse(BaseModel):
     codes: list[TotpBackupCodeItem]
 
 class UserSettings(BaseModel):
     tmdb_api_key: Optional[str] = None
+    rpdb_api_key: Optional[str] = Field(default=None, max_length=255)
+    has_rpdb_key: bool = False
     has_effective_tmdb_key: bool = False
     has_global_tmdb_key: bool = False
 
     # TVDB
     tvdb_api_key: Optional[str] = None
+    tvdb_subscriber_pin: Optional[str] = None
     has_global_tvdb_key: bool = False
     has_effective_tvdb_key: bool = False
 
@@ -85,6 +140,8 @@ class UserSettings(BaseModel):
     radarr_root_folder: Optional[str] = None
     radarr_quality_profile: Optional[int] = None
     radarr_tags: Optional[list[int]] = None
+    radarr_customize_on_add: Optional[bool] = None
+    has_effective_radarr: bool = False  # read-only, user-or-global config fully set
 
     # Sonarr integration
     sonarr_url: Optional[str] = None
@@ -93,6 +150,8 @@ class UserSettings(BaseModel):
     sonarr_quality_profile: Optional[int] = None
     sonarr_tags: Optional[list[int]] = None
     sonarr_season_folder: Optional[bool] = None
+    sonarr_customize_on_add: Optional[bool] = None
+    has_effective_sonarr: bool = False  # read-only, user-or-global config fully set
 
     # Trakt — app credentials + sync flags; OAuth tokens managed via /trakt/* endpoints
     trakt_client_id: Optional[str] = None
@@ -101,37 +160,60 @@ class UserSettings(BaseModel):
     trakt_sync_watched: Optional[bool] = None
     trakt_sync_ratings: Optional[bool] = None
     trakt_sync_lists: Optional[bool] = None
+    trakt_sync_dropped: Optional[bool] = None
     trakt_watchlist_split: Optional[bool] = None
     trakt_push_watched: Optional[bool] = None
     trakt_push_ratings: Optional[bool] = None
     trakt_push_collection: Optional[bool] = None
+    trakt_push_dropped: Optional[bool] = None
     trakt_push_lists: Optional[bool] = None
     trakt_scrobble: Optional[bool] = None
+    trakt_show_comments: Optional[bool] = None
     trakt_auto_sync_interval: Optional[float] = None
     trakt_auto_push_interval: Optional[float] = None
 
     # Simkl — client_id only (PIN flow, no secret); OAuth token managed via /simkl/* endpoints
     simkl_client_id: Optional[str] = None
     simkl_connected: Optional[bool] = None  # read-only, derived from token presence
+    simkl_auth_v1: Optional[bool] = None  # read-only, connected through the deprecated AUTH V1 (no refresh token)
     simkl_sync_watched: Optional[bool] = None
     simkl_sync_ratings: Optional[bool] = None
     simkl_sync_lists: Optional[bool] = None
+    simkl_sync_dropped: Optional[bool] = None
     simkl_push_watched: Optional[bool] = None
     simkl_push_ratings: Optional[bool] = None
+    simkl_push_dropped: Optional[bool] = None
     simkl_scrobble: Optional[bool] = None
     simkl_auto_sync_interval: Optional[float] = None
     simkl_auto_push_interval: Optional[float] = None
 
+    # WeTrakr — single Scrob-owned app key (core/wetrakr.py), no client_id/secret
+    # field here; OAuth tokens managed via /wetrakr/* endpoints
+    wetrakr_connected: Optional[bool] = None  # read-only, derived from token presence
+    wetrakr_sync_watched: Optional[bool] = None
+    wetrakr_sync_ratings: Optional[bool] = None
+    wetrakr_push_watched: Optional[bool] = None
+    wetrakr_push_ratings: Optional[bool] = None
+    wetrakr_sync_lists: Optional[bool] = None
+    wetrakr_push_lists: Optional[bool] = None
+    wetrakr_sync_comments: Optional[bool] = None
+    wetrakr_push_comments: Optional[bool] = None
+    wetrakr_auto_sync_interval: Optional[float] = None
+    wetrakr_auto_push_interval: Optional[float] = None
+
     # MDBList — API key authentication
     mdblist_api_key: Optional[str] = None
     mdblist_connected: Optional[bool] = None  # read-only, validated by /auth/connection-status
+    has_global_mdblist_key: bool = False  # read-only; global key is for list imports only
     mdblist_sync_watched: Optional[bool] = None
     mdblist_sync_ratings: Optional[bool] = None
     mdblist_sync_watchlist: Optional[bool] = None
+    mdblist_sync_dropped: Optional[bool] = None
     mdblist_push_watched: Optional[bool] = None
     mdblist_push_ratings: Optional[bool] = None
     mdblist_push_watchlist: Optional[bool] = None
     mdblist_push_collection: Optional[bool] = None
+    mdblist_push_dropped: Optional[bool] = None
     mdblist_scrobble: Optional[bool] = None
     mdblist_auto_sync_interval: Optional[float] = None
     mdblist_auto_push_interval: Optional[float] = None
@@ -140,23 +222,50 @@ class UserSettings(BaseModel):
     bingebase_webhook_url: Optional[str] = None
     bingebase_api_key: Optional[str] = None
     bingebase_connected: Optional[bool] = None  # read-only, derived from webhook_url presence
-    bingebase_sync_watched: Optional[bool] = None
     bingebase_scrobble: Optional[bool] = None
     bingebase_push_watched: Optional[bool] = None
     bingebase_push_ratings: Optional[bool] = None
-    bingebase_auto_sync_interval: Optional[float] = None
-    bingebase_auto_push_interval: Optional[float] = None
+    bingebase_auto_push_interval: Optional[float] = Field(default=None, ge=0.25)
 
     preferences: Optional[dict] = None
     blur_explicit: Optional[bool] = None
     time_format_24h: Optional[bool] = None
     use_hls_player: Optional[bool] = None
+    show_play_button: Optional[bool] = None
     shuffle_next_up: Optional[bool] = None
     minimalist_next_up: Optional[bool] = None
+    next_up_by_recent_watch: Optional[bool] = None
     hide_watched_from_recently_added: Optional[bool] = None
+    condense_history_by_show: Optional[bool] = None
+    rate_prompt_movies: Optional[bool] = None
+    rate_prompt_episodes: Optional[bool] = None
+    duplicate_watch_window_minutes: Optional[int] = Field(default=None, ge=0)
+    # NULL inherits server_episode_order, the admin-configured default below
+    # (read-only, computed).
+    default_episode_order: Optional[str] = None
+    server_episode_order: Optional[str] = None
+    ui_language: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    @field_validator("ui_language")
+    @classmethod
+    def validate_ui_language(cls, value):
+        # Only the shape of a language tag is checked here: the frontend's
+        # project.inlang/settings.json is the single list of shipped languages,
+        # and the middleware ignores a stored code that isn't one of them (the
+        # browser language applies instead), so adding a language needs no
+        # backend change.
+        # Capped at the column width (user_settings.ui_language is String(10)).
+        if value is not None and (len(value) > 10 or not UI_LANGUAGE_TAG.fullmatch(value)):
+            raise ValueError(f"Unsupported UI language: {value}")
+        return value
+
+    @field_validator("rpdb_api_key", mode="before")
+    @classmethod
+    def normalize_rpdb_api_key(cls, value):
+        from core.rpdb import normalize_api_key
+        return normalize_api_key(value) if isinstance(value, str) or value is None else value
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class NuvioLoginRequest(BaseModel):
@@ -187,6 +296,7 @@ class ArvioConnectionTestRequest(BaseModel):
 
 class ApiKeyTestRequest(BaseModel):
     key: SecretStr
+    pin: Optional[SecretStr] = None  # TVDB subscriber PIN, ignored by other providers
 
 
 class ServiceConnectionTestRequest(BaseModel):
@@ -232,10 +342,13 @@ class MediaServerConnectionBase(BaseModel):
     watchlist_monitored_users: Optional[list[str]] = None
     plex_sync_watchlist: bool = False
     plex_push_watchlist: bool = False
+    plex_account_id: Optional[str] = None
+    plex_machine_identifier: Optional[str] = None
 
 
 class MediaServerConnectionCreate(MediaServerConnectionBase):
-    pass
+    # Account-level token from "Login with Plex"; never echoed back in responses.
+    plex_auth_token: Optional[str] = None
 
 
 class MediaServerConnectionUpdate(BaseModel):
@@ -259,6 +372,7 @@ class MediaServerConnectionUpdate(BaseModel):
     watchlist_all_users: Optional[bool] = None
     watchlist_monitored_users: Optional[list[str]] = None
     plex_sync_watchlist: Optional[bool] = None
+    scrobble_percent: Optional[int] = Field(default=None, ge=1, le=100)
     plex_push_watchlist: Optional[bool] = None
 
 
@@ -266,6 +380,7 @@ class MediaServerConnectionResponse(MediaServerConnectionBase):
     id: int
     user_id: int
     created_at: datetime
+    scrobble_percent: int = 90
 
     @model_validator(mode="after")
     def redact_cloud_credentials(self):
@@ -273,8 +388,7 @@ class MediaServerConnectionResponse(MediaServerConnectionBase):
             self.token = ""
         return self
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ScrobbleConnectionCreate(BaseModel):
     type: str
@@ -290,23 +404,33 @@ class ScrobbleConnectionUpdate(BaseModel):
     sync_collection: Optional[bool] = None
     sync_watched: Optional[bool] = None
     sync_playback: Optional[bool] = None
+    scrobble_percent: Optional[int] = Field(default=None, ge=1, le=100)
 
 
 class ScrobbleConnectionResponse(ScrobbleConnectionCreate):
     id: int
     user_id: int
     created_at: datetime
+    scrobble_percent: int = 90
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PasswordUpdate(BaseModel):
     current_password: Optional[str] = None
     new_password: str
 
+class EmailChange(BaseModel):
+    new_email: EmailStr
+    current_password: Optional[str] = None
+
 class WatchEventCreate(BaseModel):
-    tmdb_id: int
+    # Any one of media_id / tmdb_id / tvdb_id identifies the item (see
+    # core/identity.py). tmdb_id used to be mandatory; a TVDB-only episode
+    # has none, so clients send media_id (or tvdb_id + series_tvdb_id context).
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_id: Optional[int] = None
     media_type: MediaType
     watched_at: Optional[datetime] = None  # omitted = now; explicit null = unknown date
     completed: bool = True
@@ -314,6 +438,20 @@ class WatchEventCreate(BaseModel):
     series_tvdb_id: Optional[int] = None  # lets the show be linked to TVDB (see #101) without requiring a prior visit to its TVDB page
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
+    # Set after the user confirms a "this looks like a duplicate, add anyway?"
+    # prompt (see the 409 duplicate_watch response from POST /history), to
+    # record it despite an existing watch within the dedup window (#390).
+    force: bool = False
+    # Where the watch came from, for API clients (#492). Omitted = "manual", the
+    # web UI's own button. Any slug is allowed, so a backfill script can say "plex".
+    source: str = "manual"
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-z0-9_-]{1,16}", v):
+            raise ValueError("source must be 1-16 lowercase letters, digits, '_' or '-'")
+        return v
 
 
 class ManualSessionStart(BaseModel):
@@ -362,8 +500,7 @@ class UserProfileResponse(BaseModel):
     def _none_to_list(cls, v: object) -> list:
         return v if v is not None else []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class PublicProfileResponse(BaseModel):
     id: int
@@ -397,7 +534,9 @@ class PublicProfileResponse(BaseModel):
 
 class GlobalSettings(BaseModel):
     tmdb_api_key           : Optional[str] = None
+    mdblist_api_key        : Optional[str] = None
     tvdb_api_key           : Optional[str] = None
+    tvdb_subscriber_pin    : Optional[str] = None
     radarr_url             : Optional[str] = None
     radarr_token           : Optional[str] = None
     radarr_root_folder     : Optional[str] = None
@@ -411,12 +550,15 @@ class GlobalSettings(BaseModel):
     sonarr_season_folder        : bool = True
     radarr_require_approval     : bool = False
     sonarr_require_approval     : bool = False
+    radarr_customize_on_add     : bool = False
+    sonarr_customize_on_add     : bool = False
+    default_episode_order       : Optional[str] = None
     image_cache_enabled         : bool = False
-    image_cache_limit_gb        : Optional[int] = None
-    allow_public_profiles       : bool = False
+    image_cache_limit_gb        : Optional[float] = None
+    enable_logged_out_navigation: bool = False
+    disable_comments            : bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MediaRequestOut(BaseModel):
@@ -431,8 +573,7 @@ class MediaRequestOut(BaseModel):
     created_at  : datetime
     updated_at  : datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AdminUser(BaseModel):
@@ -442,6 +583,18 @@ class AdminUser(BaseModel):
     is_admin   : bool
     api_key    : str
     created_at : datetime
+    avatar_url : Optional[str] = None
+    totp_enabled : bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AdminPasswordReset(BaseModel):
+    password : str = Field(min_length=1)
+
+
+class AdminUserCreate(BaseModel):
+    username : str = Field(min_length=1, max_length=150)
+    email    : EmailStr
+    password : str = Field(min_length=1)
+    is_admin : bool = False

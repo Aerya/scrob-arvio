@@ -15,6 +15,7 @@ from models.base import MediaType
 from models.media import Media
 from models.show import Show
 from routers.mdblist import (
+    _describe_not_found,
     _episode_identity,
     _merge_show_entries,
     _payload_item,
@@ -22,7 +23,7 @@ from routers.mdblist import (
     _resolve_external_tmdb_id,
     _season_identity,
 )
-from routers.lists import _push_list_item_to_mdblist
+from routers.lists import _push_watchlist_item_to_mdblist
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -103,6 +104,92 @@ class MDBListClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(offsets, [0, 2])
         self.assertEqual(len(result["movies"]), 3)
 
+    async def test_get_list_items_uses_unified_cursor_pagination_and_cap(self) -> None:
+        cursors: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/lists/alice/favourites/items")
+            self.assertEqual(request.url.params["apikey"], "secret-key")
+            self.assertEqual(request.url.params["unified"], "true")
+            cursor = request.url.params.get("cursor")
+            cursors.append(cursor)
+            if cursor is None:
+                self.assertEqual(request.url.params["limit"], "3")
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": 1, "mediatype": "movie"},
+                        {"id": 2, "mediatype": "movie"},
+                    ],
+                    headers={
+                        "X-Has-More": "true",
+                        "X-Next-Cursor": "page-2",
+                    },
+                )
+            self.assertEqual(request.url.params["limit"], "1")
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 3, "mediatype": "show"},
+                    {"id": 4, "mediatype": "show"},
+                ],
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx,
+            "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.get_list_items(
+                "secret-key", "alice/favourites", max_items=3
+            )
+
+        self.assertEqual(cursors, [None, "page-2"])
+        self.assertEqual([item["id"] for item in result["movies"]], [1, 2])
+        self.assertEqual([item["id"] for item in result["shows"]], [3])
+
+    async def test_get_list_accepts_movie_and_show_metadata_array(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(
+                request.url.path,
+                "/lists/w2dwave/psychological-thrillers",
+            )
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 41,
+                        "name": "Psychological Thrillers",
+                        "description": "",
+                        "mediatype": "movie",
+                    },
+                    {
+                        "id": 42,
+                        "name": "Psychological Thrillers",
+                        "description": "Movies and shows that get in your head.",
+                        "mediatype": "show",
+                    },
+                ],
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx,
+            "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.get_list(
+                "secret-key", "w2dwave/psychological-thrillers"
+            )
+
+        self.assertEqual(result["id"], 41)
+        self.assertEqual(result["name"], "Psychological Thrillers")
+        self.assertEqual(
+            result["description"],
+            "Movies and shows that get in your head.",
+        )
+
     async def test_push_watched_batches_each_media_type(self) -> None:
         calls: list[tuple[str, int]] = []
 
@@ -133,12 +220,194 @@ class MDBListClientTests(unittest.IsolatedAsyncioTestCase):
             result = await mdblist.push_watched("secret-key", payload)
 
         self.assertEqual(calls, [("movies", 2), ("movies", 1), ("episodes", 1)])
-        self.assertEqual(result, {"submitted": 4, "batches": 3, "not_found": 0})
+        self.assertEqual(result, {"submitted": 4, "batches": 3, "not_found": 0, "not_found_items": []})
 
+    async def test_push_keeps_the_items_mdblist_reports_not_found(self) -> None:
+        # #340: the "N not found" count is useless without the ids - keep the
+        # echoed-back item bodies (tagged with a singular kind) so the push
+        # job can log exactly which entries MDBList rejected.
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "added": {},
+                "not_found": {
+                    "movies": [{"ids": {"tmdb": 999001}, "title": "Ghost Movie"}],
+                    "shows": [{"ids": {"tmdb": 999002}, "seasons": [{"number": 2, "episodes": [{"number": 4}]}]}],
+                },
+            })
+
+        payload = {
+            "movies": [{"ids": {"tmdb": 1}}], "seasons": [], "episodes": [],
+            "shows": [{"ids": {"tmdb": 2}}],
+        }
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx, "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.push_watched("secret-key", payload)
+
+        self.assertEqual(result["not_found"], 4)  # 2 batches x {movie, show}
+        self.assertIn({"kind": "movie", "item": {"ids": {"tmdb": 999001}, "title": "Ghost Movie"}},
+                      result["not_found_items"])
+        self.assertIn(
+            {"kind": "show", "item": {"ids": {"tmdb": 999002}, "seasons": [{"number": 2, "episodes": [{"number": 4}]}]}},
+            result["not_found_items"],
+        )
+
+    def test_push_batch_size_does_not_exceed_mdblist_limit(self) -> None:
+        # Regression test for #176: MDBList rejects any request with more
+        # than 200 top-level entries ("Too many shows in one request (max
+        # 200)") - PUSH_BATCH_SIZE was set to 500, so a push job for a
+        # watched-list over 200 items failed outright instead of being
+        # chunked, even though the batching mechanism itself was correct.
+        self.assertLessEqual(mdblist.PUSH_BATCH_SIZE, 200)
+
+    async def test_push_watched_chunks_large_show_list_within_mdblist_limit(self) -> None:
+        # End-to-end with the real (unpatched) PUSH_BATCH_SIZE: a watched-list
+        # of 450 shows must be split into batches MDBList would actually accept.
+        batch_sizes: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            batch_sizes.append(len(payload["shows"]))
+            return httpx.Response(200, json={"added": {}, "not_found": {}})
+
+        payload = {
+            "movies": [], "seasons": [], "episodes": [],
+            "shows": [{"ids": {"tmdb": i}} for i in range(450)],
+        }
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx,
+            "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.push_watched("secret-key", payload)
+
+        self.assertTrue(all(size <= 200 for size in batch_sizes), batch_sizes)
+        self.assertEqual(sum(batch_sizes), 450)
+        self.assertEqual(result["submitted"], 450)
+
+    async def test_push_dropped_batch_sends_one_request_for_all_shows(self) -> None:
+        # #329: the scheduled push reconciles missing dropped shows in one call.
+        seen: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/sync/dropped")
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json={"added": {"shows": 2}})
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx, "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            await mdblist.push_dropped_batch("secret-key", [95479, 1399], "2026-08-27T00:00:00Z")
+            await mdblist.push_dropped("secret-key", 550, "2026-08-27T00:00:00Z")
+
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(
+            seen[0]["shows"],
+            [
+                {"ids": {"tmdb": 95479}, "dropped_at": "2026-08-27T00:00:00Z"},
+                {"ids": {"tmdb": 1399}, "dropped_at": "2026-08-27T00:00:00Z"},
+            ],
+        )
+        self.assertEqual(seen[1]["shows"], [{"ids": {"tmdb": 550}, "dropped_at": "2026-08-27T00:00:00Z"}])
+
+
+class MDBListRateLimitTests(unittest.IsolatedAsyncioTestCase):
+    """MDBList answers both its throttles with 429 - only the body tells them
+    apart. Short-window limits are waited out, the daily quota is not."""
+
+    async def _call(self, responses, call, *args, **kwargs):
+        seen = iter(responses)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return next(seen)
+
+        transport = httpx.MockTransport(handler)
+        sleep = AsyncMock()
+        with (
+            patch.object(
+                mdblist.httpx,
+                "AsyncClient",
+                side_effect=lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw),
+            ),
+            patch.object(mdblist.asyncio, "sleep", sleep),
+        ):
+            try:
+                result = await call(*args, **kwargs)
+                error = None
+            except mdblist.MDBListAPIError as exc:
+                result, error = None, exc
+        return result, error, requests, sleep
+
+    async def test_short_window_limit_is_retried_with_backoff(self) -> None:
+        limited = httpx.Response(429, json={"error": "API rate limit exceeded!"})
+        result, error, requests, sleep = await self._call(
+            [limited, limited, httpx.Response(200, json={"ok": True})],
+            mdblist._request, "GET", "/sync/watched", "key",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(requests), 3)
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [2.0, 4.0])
+
+    async def test_retry_after_header_is_honoured_but_capped(self) -> None:
+        limited = httpx.Response(
+            429, json={"error": "API rate limit exceeded!"}, headers={"Retry-After": "3600"}
+        )
+        _, error, _, sleep = await self._call(
+            [limited, httpx.Response(200, json={})], mdblist._request, "GET", "/x", "key",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(sleep.await_args_list[0].args[0], mdblist._RATE_LIMIT_MAX_WAIT)
+
+    async def test_daily_limit_is_not_retried(self) -> None:
+        _, error, requests, sleep = await self._call(
+            [httpx.Response(429, json={"error": "Daily API limit exceeded!"})],
+            mdblist._request, "GET", "/x", "key",
+        )
+        self.assertIsInstance(error, mdblist.MDBListDailyLimitError)
+        self.assertEqual(len(requests), 1)
+        sleep.assert_not_awaited()
+
+    async def test_gives_up_after_the_retry_budget(self) -> None:
+        limited = httpx.Response(429, json={"error": "API rate limit exceeded!"})
+        _, error, requests, _ = await self._call(
+            [limited] * (mdblist._RATE_LIMIT_RETRIES + 1), mdblist._request, "GET", "/x", "key",
+        )
+        self.assertIsInstance(error, mdblist.MDBListAPIError)
+        self.assertNotIsInstance(error, mdblist.MDBListDailyLimitError)
+        self.assertEqual(len(requests), mdblist._RATE_LIMIT_RETRIES + 1)
+
+    async def test_live_scrobble_retries_once_with_a_short_wait(self) -> None:
+        # A scrobble runs inside a webhook request that holds a DB connection,
+        # so it must not sit through the full backoff.
+        limited = httpx.Response(
+            429, json={"error": "API rate limit exceeded!"}, headers={"Retry-After": "120"}
+        )
+        _, error, requests, sleep = await self._call(
+            [limited, limited], mdblist.scrobble_movie, "key", "stop", 550, 95.0,
+        )
+        self.assertIsInstance(error, mdblist.MDBListAPIError)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [mdblist._SCROBBLE_MAX_WAIT])
+
+    async def test_non_rate_limit_errors_are_not_retried(self) -> None:
+        _, error, requests, sleep = await self._call(
+            [httpx.Response(500, text="boom")], mdblist._request, "GET", "/x", "key",
+        )
+        self.assertIsInstance(error, mdblist.MDBListAPIError)
+        self.assertEqual(len(requests), 1)
+        sleep.assert_not_awaited()
 
 
 class MDBListListFanoutTests(unittest.IsolatedAsyncioTestCase):
-    async def test_managed_watchlist_edit_pushes_to_mdblist(self) -> None:
+    async def test_native_watchlist_edit_pushes_to_mdblist(self) -> None:
         result = MagicMock()
         result.scalar_one_or_none.return_value = SimpleNamespace(
             mdblist_push_watchlist=True,
@@ -150,10 +419,9 @@ class MDBListListFanoutTests(unittest.IsolatedAsyncioTestCase):
         push_watchlist = AsyncMock()
 
         with patch.object(mdblist, "push_watchlist", push_watchlist):
-            await _push_list_item_to_mdblist(
+            await _push_watchlist_item_to_mdblist(
                 db,
                 user_id=1,
-                list_mdblist_slug="__watchlist__",
                 media=media,
             )
 
@@ -586,6 +854,164 @@ class ImportWatchedSkipsShowRollupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["watched"], 2)
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(changed, {1, 2})
+
+
+class DescribeNotFoundTests(unittest.TestCase):
+    """#340: the push job logs which items MDBList rejected, defensively
+    against MDBList's echo shape."""
+
+    def test_movie_with_title(self):
+        self.assertEqual(
+            _describe_not_found({"kind": "movie", "item": {"ids": {"tmdb": 550}, "title": "Fight Club"}}),
+            'movie tmdb:550 "Fight Club"',
+        )
+
+    def test_show_with_nested_season_episode(self):
+        self.assertEqual(
+            _describe_not_found({"kind": "show", "item": {
+                "ids": {"tmdb": 1396}, "seasons": [{"number": 2, "episodes": [{"number": 4}]}],
+            }}),
+            "show tmdb:1396 S2E4",
+        )
+
+    def test_flat_season_episode_and_imdb_fallback(self):
+        self.assertEqual(
+            _describe_not_found({"kind": "episode", "item": {"imdb": "tt0903747", "season": 1, "episode": 3}}),
+            "episode imdb:tt0903747 S1E3",
+        )
+
+    def test_missing_everything_is_still_a_string(self):
+        self.assertEqual(_describe_not_found({}), "item no-id")
+        self.assertEqual(_describe_not_found({"kind": "movie", "item": "garbage"}), "movie no-id")
+
+    def test_recovered_show_candidate_resolves_to_a_title(self):
+        # #368: the id-less episode echo carries _candidate_show_tmdb_ids
+        # (attached by core.mdblist._push) instead of MDBList's own ids.
+        entry = {"kind": "episode", "item": {"season": 6, "_candidate_show_tmdb_ids": [1396]}}
+        self.assertEqual(
+            _describe_not_found(entry, show_titles={1396: "Breaking Bad"}),
+            "episode no-id S6 (show: Breaking Bad)",
+        )
+
+    def test_recovered_show_candidate_without_a_known_title_falls_back_to_tmdb_id(self):
+        entry = {"kind": "episode", "item": {"season": 6, "_candidate_show_tmdb_ids": [1396]}}
+        self.assertEqual(
+            _describe_not_found(entry, show_titles={}),
+            "episode no-id S6 (show: tmdb:1396)",
+        )
+
+    def test_multiple_candidates_are_listed_as_possibly(self):
+        entry = {"kind": "episode", "item": {"season": 6, "_candidate_show_tmdb_ids": [100, 200]}}
+        self.assertEqual(
+            _describe_not_found(entry, show_titles={100: "Poirot", 200: "Marple"}),
+            "episode no-id S6 (possibly: Poirot, Marple)",
+        )
+
+    def test_candidates_are_ignored_once_a_real_id_is_present(self):
+        # Shouldn't happen in practice (an id-bearing entry never gets
+        # _candidate_show_tmdb_ids attached), but the "no-id" guard should
+        # still hold if it ever did.
+        entry = {"kind": "episode", "item": {
+            "ids": {"tmdb": 42}, "season": 6, "_candidate_show_tmdb_ids": [100],
+        }}
+        self.assertEqual(_describe_not_found(entry, show_titles={100: "Poirot"}), "episode tmdb:42 S6")
+
+
+class IndexEpisodeShowsTests(unittest.TestCase):
+    """#368: recovers a request batch's own (season, episode) -> show tmdb id
+    mapping, since MDBList's not_found response doesn't echo it back."""
+
+    def test_exact_season_and_episode_match(self):
+        batch = {"shows": [{"ids": {"tmdb": 100}, "seasons": [{"number": 2, "episodes": [{"number": 4}]}]}]}
+        exact, by_season = mdblist._index_episode_shows(batch)
+        self.assertEqual(exact[(2, 4)], [100])
+        self.assertEqual(by_season[2], [100])
+
+    def test_season_only_aggregates_every_show_with_that_season(self):
+        batch = {"shows": [
+            {"ids": {"tmdb": 100}, "seasons": [{"number": 6, "episodes": [{"number": 1}]}]},
+            {"ids": {"tmdb": 200}, "seasons": [{"number": 6, "episodes": [{"number": 2}]}]},
+        ]}
+        exact, by_season = mdblist._index_episode_shows(batch)
+        self.assertEqual(sorted(by_season[6]), [100, 200])
+
+    def test_show_with_no_tmdb_id_is_not_indexed(self):
+        batch = {"shows": [{"ids": {}, "seasons": [{"number": 1, "episodes": [{"number": 1}]}]}]}
+        exact, by_season = mdblist._index_episode_shows(batch)
+        self.assertEqual(exact, {})
+        self.assertEqual(by_season, {})
+
+
+class PushRecoversEpisodeShowContextTests(unittest.IsolatedAsyncioTestCase):
+    """#368: an episode MDBList reports not found comes back in its own flat
+    "episodes" bucket with just a season (sometimes not even an episode)
+    number and no id - even though the request nested it under its show's
+    tmdb id. _push must recover that from the request it just sent, since
+    the response never carries it."""
+
+    async def test_exact_season_episode_match_is_attached(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "added": {}, "not_found": {"episodes": [{"season": 6, "episode": 3}]},
+            })
+
+        payload = {
+            "movies": [], "seasons": [], "episodes": [],
+            "shows": [{"ids": {"tmdb": 555}, "seasons": [{"number": 6, "episodes": [{"number": 3}]}]}],
+        }
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx, "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.push_watched("secret-key", payload)
+
+        self.assertEqual(
+            result["not_found_items"],
+            [{"kind": "episode", "item": {"season": 6, "episode": 3, "_candidate_show_tmdb_ids": [555]}}],
+        )
+
+    async def test_season_only_echo_lists_every_show_with_that_season(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"added": {}, "not_found": {"episodes": [{"season": 6}]}})
+
+        payload = {
+            "movies": [], "seasons": [], "episodes": [],
+            "shows": [
+                {"ids": {"tmdb": 100}, "seasons": [{"number": 6, "episodes": [{"number": 1}]}]},
+                {"ids": {"tmdb": 200}, "seasons": [{"number": 6, "episodes": [{"number": 9}]}]},
+            ],
+        }
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx, "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.push_watched("secret-key", payload)
+
+        item = result["not_found_items"][0]["item"]
+        self.assertEqual(sorted(item["_candidate_show_tmdb_ids"]), [100, 200])
+
+    async def test_entry_with_its_own_id_is_left_untouched(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "added": {},
+                "not_found": {"episodes": [{"ids": {"tmdb": 999}, "season": 1, "episode": 1}]},
+            })
+
+        payload = {
+            "movies": [], "seasons": [], "episodes": [],
+            "shows": [{"ids": {"tmdb": 555}, "seasons": [{"number": 1, "episodes": [{"number": 1}]}]}],
+        }
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            mdblist.httpx, "AsyncClient",
+            side_effect=lambda **kwargs: _REAL_ASYNC_CLIENT(transport=transport, **kwargs),
+        ):
+            result = await mdblist.push_watched("secret-key", payload)
+
+        item = result["not_found_items"][0]["item"]
+        self.assertNotIn("_candidate_show_tmdb_ids", item)
 
 
 if __name__ == "__main__":

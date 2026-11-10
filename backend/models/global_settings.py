@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, String
+from sqlalchemy import Boolean, Float, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -12,6 +12,7 @@ class GlobalSettings(Base):
 
     id                     : Mapped[int]           = mapped_column(Integer, primary_key=True)
     tmdb_api_key           : Mapped[Optional[str]] = mapped_column(String(255))
+    mdblist_api_key        : Mapped[Optional[str]] = mapped_column(String(255))
     radarr_url             : Mapped[Optional[str]] = mapped_column(String(500))
     radarr_token           : Mapped[Optional[str]] = mapped_column(String(500))
     radarr_root_folder     : Mapped[Optional[str]] = mapped_column(String(500))
@@ -25,7 +26,18 @@ class GlobalSettings(Base):
     sonarr_season_folder         : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="true")
     radarr_require_approval      : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
     sonarr_require_approval      : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
+    radarr_customize_on_add      : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
+    sonarr_customize_on_add      : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
     tvdb_api_key                 : Mapped[Optional[str]] = mapped_column(String(255))
+    tvdb_subscriber_pin          : Mapped[Optional[str]] = mapped_column(String(255))
+    # Server-wide order key for users who haven't picked one themselves - same
+    # override chain as the API keys above. NULL means aired order, the
+    # historical behaviour.
+    default_episode_order        : Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     image_cache_enabled          : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
-    image_cache_limit_gb         : Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    allow_public_profiles        : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
+    image_cache_limit_gb         : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    enable_logged_out_navigation : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
+    disable_comments             : Mapped[bool]          = mapped_column(Boolean, nullable=False, server_default="false")
+    # Stable X-Plex-Client-Identifier for this Scrob instance. Generated on first
+    # use of "Login with Plex"; kept forever so Plex keeps recognising the device.
+    plex_client_identifier       : Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

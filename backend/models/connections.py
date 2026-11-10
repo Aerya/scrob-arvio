@@ -20,6 +20,14 @@ class MediaServerConnection(Base):
     server_user_id   : Mapped[Optional[str]] = mapped_column(String(255))  # jellyfin/emby user ID
     server_username  : Mapped[Optional[str]] = mapped_column(String(255))  # plex username for webhook attribution
 
+    # Plex "Login with Plex" (PIN auth). NULL on manually-configured connections.
+    # plex_auth_token is the account-level token (needed for watchlist / Discover /
+    # community calls, which a scoped per-server token can't make); token stays the
+    # per-server token used for library reads and scrobbling.
+    plex_auth_token         : Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    plex_account_id         : Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    plex_machine_identifier : Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
     # Inbound sync flags (source → Scrob)
     sync_collection  : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
     sync_watched     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
@@ -47,12 +55,42 @@ class MediaServerConnection(Base):
     stremio_pull_cursor_at     : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     stremio_full_sync_done     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     stremio_pushed_library_ids : Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    scrobble_percent   : Mapped[int] = mapped_column(Integer, nullable=False, default=90, server_default="90")
+    stremio_pending_pull_ids   : Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     # Plex watchlist ↔ Scrob list sync (Plex connections only)
     plex_sync_watchlist : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     plex_push_watchlist : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Typed keys ("movie:603") on the Plex watchlist as of the last successful
+    # reconcile; NULL = never reconciled, so deletions are never inferred.
+    # Unrelated to watchlist_synced_ids above (the Radarr/Sonarr request cache).
+    plex_watchlist_synced_keys : Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     # Plex per-play watch history backfill cursor (Plex connections only)
     plex_history_cursor_at : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at       : Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def plex_account_token(self) -> str:
+        """Token for account-scoped Plex calls (watchlist, Discover, community).
+
+        Uses the account-level token from "Login with Plex" when present, else
+        falls back to the stored server token (correct for owner-token setups)."""
+        return self.plex_auth_token or self.token
+
+    @property
+    def push_enabled(self) -> bool:
+        """Whether this connection has any Scrob → server push direction enabled.
+
+        Single source of truth for the auto-push scheduler and the manual push
+        endpoint, so a newly added push flag can't be forgotten in one of them
+        again (plex_push_watchlist was, leaving watchlist-only connections
+        without auto-push)."""
+        return bool(
+            self.push_collection
+            or self.push_watched
+            or self.push_playback
+            or self.push_ratings
+            or self.plex_push_watchlist
+        )

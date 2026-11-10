@@ -2,15 +2,26 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
 from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import StaticPool
 
 from models.connections import MediaServerConnection
 from routers import sync
+
+
+@compiles(JSONB, "sqlite")
+def _jsonb_as_json_on_sqlite(type_, compiler, **kw):
+    """JSONB is PostgreSQL-only and has no SQLite rendering of its own."""
+    return "JSON"
 
 
 class _Result:
@@ -109,13 +120,19 @@ class PlexSyncNeedsLibraryScanTests(unittest.TestCase):
 class _PlexHistoryFakeDB:
     """Minimal async-session double for _backfill_plex_watch_history: just
     enough to serve db.get(MediaServerConnection), the existing-WatchEvent
-    select, db.add()/flush()/commit(), and the reconciling UPDATE statement."""
+    select, the #320 pending-push select, db.add()/flush()/commit(), and the
+    reconciling UPDATE statement."""
 
-    def __init__(self, conn, existing_watch_rows):
+    def __init__(self, conn, existing_watch_rows, pending_push_rows=None):
         self.conn = conn
         self.existing_watch_rows = existing_watch_rows
+        # (pending_push_id, media_id, pushed_at) rows - defaults to none
+        # still awaiting their echo, since most of these tests aren't
+        # exercising that reconciliation path.
+        self.pending_push_rows = pending_push_rows or []
         self.added: list = []
         self.updates: list[dict] = []
+        self.deletes: list = []
         self.commit = AsyncMock()
 
     async def __aenter__(self):
@@ -132,6 +149,11 @@ class _PlexHistoryFakeDB:
         if sql.startswith("UPDATE watch_events"):
             self.updates.append(dict(statement.compile().params))
             return None
+        if sql.startswith("DELETE FROM plex_pending_pushes"):
+            self.deletes.append(statement)
+            return None
+        if "FROM plex_pending_pushes" in sql:
+            return list(self.pending_push_rows)
         return list(self.existing_watch_rows)
 
     def add(self, obj):
@@ -151,10 +173,11 @@ class BackfillPlexWatchHistoryDedupTests(unittest.IsolatedAsyncioTestCase):
     and only against provisional rows, not a broad time-window match against
     any existing play regardless of source (the original, too-broad fix)."""
 
-    async def _run(self, existing_watch_rows, history_entries):
+    async def _run(self, existing_watch_rows, history_entries, pending_push_rows=None):
         # existing_watch_rows: list of (id, media_id, watched_at, provisional)
+        # pending_push_rows: list of (pending_push_id, media_id, pushed_at)
         conn = SimpleNamespace(plex_history_cursor_at=None)
-        db = _PlexHistoryFakeDB(conn, existing_watch_rows)
+        db = _PlexHistoryFakeDB(conn, existing_watch_rows, pending_push_rows)
 
         with (
             patch.object(sync, "async_sessionmaker", return_value=lambda *a, **k: db),
@@ -216,14 +239,13 @@ class BackfillPlexWatchHistoryDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(db.added), 1)
         self.assertEqual(db.added[0].watched_at, authoritative_watched_at)
 
-    async def test_confirmed_event_requires_exact_match_not_a_window(self):
-        # A non-provisional (already-confirmed) row — e.g. from a prior run of
-        # this same backfill, or an unrelated Trakt/Simkl import — must only
-        # be treated as the same play on an exact watched_at match. A close
-        # but non-identical confirmed row must NOT suppress recording the
-        # authoritative play, unlike the old blanket time-window approach.
+    async def test_confirmed_event_outside_reconcile_window_is_not_suppressed(self):
+        # A non-provisional (already-confirmed) row - e.g. from a prior run of
+        # this same backfill, or an unrelated Trakt/Simkl import - that's well
+        # outside PLEX_CONFIRMED_RECONCILE_WINDOW is a genuinely distinct play,
+        # not an echo of a synchronous push (#320) - must still get its own row.
         confirmed_watched_at = datetime(2026, 8, 1, 20, 0, 0)
-        authoritative_watched_at = confirmed_watched_at + timedelta(minutes=2)
+        authoritative_watched_at = confirmed_watched_at + timedelta(minutes=5)
 
         new_events, reconciled, unmatched, db = await self._run(
             existing_watch_rows=[(101, 10, confirmed_watched_at, False)],
@@ -234,6 +256,50 @@ class BackfillPlexWatchHistoryDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reconciled, 0)
         self.assertEqual(db.updates, [])
         self.assertEqual(len(db.added), 1)
+
+    async def test_confirmed_event_within_reconcile_window_is_treated_as_push_echo(self):
+        # #320: marking something watched in Scrob pushes to Plex
+        # synchronously, so a play showing up within
+        # PLEX_CONFIRMED_RECONCILE_WINDOW of an existing confirmed watch for
+        # the same media is almost certainly that same push echoing back -
+        # must reconcile (no new row), and leave the confirmed event's own
+        # watched_at untouched (no UPDATE, unlike the provisional-webhook path).
+        confirmed_watched_at = datetime(2026, 8, 1, 20, 0, 0)
+        echo_watched_at = confirmed_watched_at + timedelta(minutes=2)
+
+        new_events, reconciled, unmatched, db = await self._run(
+            existing_watch_rows=[(101, 10, confirmed_watched_at, False)],
+            history_entries=[self._history_entry(echo_watched_at)],
+        )
+
+        self.assertEqual(new_events, 0)
+        self.assertEqual(reconciled, 1)
+        self.assertEqual(db.updates, [])
+        self.assertEqual(db.added, [])
+
+    async def test_pending_push_echo_of_a_backdated_watch_is_reconciled(self):
+        # #320: a watch recorded long before it was pushed (e.g. imported from
+        # Trakt, then later marked watched again) is too far from the push
+        # echo's viewedAt for _has_nearby_confirmed above to catch, but the
+        # PlexPendingPush row (recorded at push time) is close to it - must
+        # reconcile against that instead of inserting a duplicate row, and
+        # consume the pending marker so it can't match a later, real rewatch.
+        confirmed_watched_at = datetime(2025, 1, 1, 20, 0, 0)
+        pushed_at = datetime(2026, 8, 1, 19, 59, 0)
+        echo_watched_at = pushed_at + timedelta(minutes=1)
+
+        new_events, reconciled, unmatched, db = await self._run(
+            existing_watch_rows=[(101, 10, confirmed_watched_at, False)],
+            history_entries=[self._history_entry(echo_watched_at)],
+            pending_push_rows=[(201, 10, pushed_at)],
+        )
+
+        self.assertEqual(new_events, 0)
+        self.assertEqual(reconciled, 1)
+        self.assertEqual(db.added, [])
+        # 2 DELETEs: the unconditional stale-pending-push cleanup that runs on
+        # every backfill pass, plus consuming this specific matched marker.
+        self.assertEqual(len(db.deletes), 2)
 
     async def test_confirmed_event_exact_match_is_a_no_op(self):
         # Re-running the backfill (e.g. cursor overlap) must not re-add a play
@@ -436,6 +502,23 @@ class ExpandMultiEpisodeItemsTests(unittest.TestCase):
         # Original item must be untouched - other code still iterates the raw list.
         self.assertEqual(item["IndexNumber"], 1)
 
+    def test_extra_episodes_do_not_inherit_first_episode_provider_ids(self):
+        """#525: the item's ProviderIds are the first episode's. Copies for the
+        later episodes must not carry them, or every copy resolves to the same
+        Media row and the file is inserted twice (uq_collection_file_source)."""
+        item = {
+            "Id": "file-1", "IndexNumber": 1, "IndexNumberEnd": 3,
+            "ProviderIds": {"Tmdb": "353500", "Tvdb": "42"},
+        }
+
+        expanded = sync._expand_multi_episode_items(
+            [item], sync.MediaType.episode, sync.CollectionSource.jellyfin,
+        )
+
+        self.assertEqual(expanded[0]["ProviderIds"], {"Tmdb": "353500", "Tvdb": "42"})
+        self.assertEqual([e["ProviderIds"] for e in expanded[1:]], [{}, {}])
+        self.assertEqual(item["ProviderIds"], {"Tmdb": "353500", "Tvdb": "42"})
+
     def test_three_episode_span_expands_to_three(self):
         item = {"Id": "file-2", "IndexNumber": 5, "IndexNumberEnd": 7}
 
@@ -474,6 +557,12 @@ class ExpandMultiEpisodeItemsTests(unittest.TestCase):
 
         self.assertEqual(expanded, [item])
 
+    def test_row_count_counts_one_row_per_expanded_episode(self):
+        items = [{"Id": "file-1", "IndexNumber": 1, "IndexNumberEnd": 3}, {"Id": "file-2", "IndexNumber": 4}]
+
+        self.assertEqual(sync._sync_row_count(items, sync.MediaType.episode, sync.CollectionSource.emby), 4)
+        self.assertEqual(sync._sync_row_count(items, sync.MediaType.episode, sync.CollectionSource.plex), 2)
+
     def test_plex_source_is_never_expanded(self):
         # Scoped to Jellyfin/Emby only - Plex doesn't expose this field at all.
         item = {"ratingKey": "1", "index": 1, "IndexNumberEnd": 2}
@@ -483,6 +572,1427 @@ class ExpandMultiEpisodeItemsTests(unittest.TestCase):
         )
 
         self.assertEqual(expanded, [item])
+
+
+from sqlalchemy.sql import Select as _SASelect
+from sqlalchemy.dialects import postgresql as _pg
+
+
+class _ReconcileFakeDB:
+    """Serves only what _reconcile_plex_watchlist itself executes: the
+    connection load (db.get, now that the function opens its own session),
+    the baseline re-read (SELECT), and the baseline write (UPDATE).
+    Everything heavier sits behind the patched load/apply helpers."""
+
+    def __init__(self, baseline, conn):
+        self._baseline = baseline
+        self.conn = conn
+        self.baseline_writes = []
+        self.commit = AsyncMock()
+        self.rollback = AsyncMock()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def get(self, model, obj_id):
+        return self.conn
+
+    async def execute(self, stmt):
+        if isinstance(stmt, _SASelect):
+            return _Result(self._baseline)
+        params = stmt.compile(dialect=_pg.dialect()).params
+        self.baseline_writes.append(params.get("plex_watchlist_synced_keys"))
+        return SimpleNamespace()
+
+
+def _wl_conn(pull=True, push=True):
+    return MediaServerConnection(
+        id=1, user_id=1, type="plex", token="tok",
+        plex_sync_watchlist=pull, plex_push_watchlist=push,
+    )
+
+
+def _remote_item(kind, tmdb_id, rating_key="rk", title="Title"):
+    return {"type": kind, "Guid": [{"id": f"tmdb://{tmdb_id}"}], "ratingKey": rating_key, "title": title}
+
+
+class PlexWatchlistReconcileTests(unittest.IsolatedAsyncioTestCase):
+    """The routine wiring around core.watchlist_reconcile: what plan reaches
+    the apply helpers, and what baseline gets persisted."""
+
+    async def _run(self, db, remote_items, local_state, applied_local, remote_failures=(set(), set())):
+        apply_local = AsyncMock(return_value=applied_local)
+        apply_remote = AsyncMock(return_value=remote_failures)
+        with patch.object(sync, "async_sessionmaker", return_value=lambda *a, **k: db), \
+             patch.object(sync.plex, "get_watchlist", AsyncMock(return_value=remote_items)), \
+             patch.object(sync, "_load_local_watchlist_state", AsyncMock(return_value=local_state)), \
+             patch.object(sync, "_apply_local_watchlist_changes", apply_local), \
+             patch.object(sync, "_apply_remote_watchlist_changes", apply_remote):
+            await sync._reconcile_plex_watchlist(1, db.conn.id, "tmdb-key")
+        local_plan = apply_local.call_args.args[4] if apply_local.call_args else None
+        remote_plan = apply_remote.call_args.args[1] if apply_remote.call_args else None
+        return local_plan, remote_plan, apply_local, apply_remote
+
+    async def test_remote_removal_is_applied_locally_not_resurrected(self):
+        """Regression: Plex auto-removed a watched item; the old additive push
+        re-added it. Now the baseline turns it into a local removal."""
+        db = _ReconcileFakeDB(["movie:1"], _wl_conn())
+        local_plan, remote_plan, _, _ = await self._run(
+            db, [], (SimpleNamespace(id=5), {"movie:1": (11, "Inception")}), applied_local=set(),
+        )
+        self.assertEqual(local_plan.remove_local, {"movie:1"})
+        self.assertEqual(remote_plan.push_add, frozenset())
+        self.assertEqual(db.baseline_writes, [[]])
+        db.commit.assert_awaited()
+
+    async def test_deleted_managed_list_resets_baseline_instead_of_wiping_plex(self):
+        """Regression: with the list deleted in the UI, a stale baseline must
+        not turn the entire real Plex watchlist into push_remove calls."""
+        db = _ReconcileFakeDB(["movie:1", "show:2"], _wl_conn())
+        remote = [_remote_item("movie", 1), _remote_item("show", 2)]
+        local_plan, remote_plan, _, _ = await self._run(
+            db, remote, (None, {}), applied_local={"movie:1", "show:2"},
+        )
+        self.assertEqual(remote_plan.push_remove, frozenset())
+        self.assertEqual(local_plan.add_local, {"movie:1", "show:2"})  # bootstrap re-import
+        self.assertEqual(db.baseline_writes, [["movie:1", "show:2"]])
+
+    async def test_bootstrap_first_contact_is_purely_additive(self):
+        db = _ReconcileFakeDB(None, _wl_conn())
+        local_plan, remote_plan, _, _ = await self._run(
+            db, [_remote_item("show", 2)],
+            (SimpleNamespace(id=5), {"movie:1": (11, "Inception")}),
+            applied_local={"movie:1", "show:2"},
+        )
+        self.assertEqual(remote_plan.push_add, {"movie:1"})
+        self.assertEqual(local_plan.add_local, {"show:2"})
+        self.assertEqual(local_plan.remove_local, frozenset())
+        self.assertEqual(db.baseline_writes, [["movie:1", "show:2"]])
+
+    async def test_failed_remote_add_stays_out_of_the_baseline(self):
+        db = _ReconcileFakeDB(["movie:1"], _wl_conn())
+        _, remote_plan, _, _ = await self._run(
+            db, [_remote_item("movie", 1)],
+            (SimpleNamespace(id=5), {"movie:1": (11, "A"), "movie:9": (12, "B")}),
+            applied_local={"movie:1", "movie:9"},
+            remote_failures=({"movie:9"}, set()),
+        )
+        self.assertEqual(remote_plan.push_add, {"movie:9"})
+        self.assertEqual(db.baseline_writes, [["movie:1"]])  # movie:9 retries next run
+
+    async def test_suppressed_run_changes_nothing(self):
+        baseline = [f"movie:{i}" for i in range(12)]
+        db = _ReconcileFakeDB(baseline, _wl_conn())
+        local = {key: (i, "T") for i, key in enumerate(baseline)}
+        _, _, apply_local, apply_remote = await self._run(
+            db, [], (SimpleNamespace(id=5), local), applied_local=set(),
+        )
+        apply_local.assert_not_called()
+        apply_remote.assert_not_called()
+        self.assertEqual(db.baseline_writes, [])
+        db.commit.assert_not_awaited()
+
+    async def test_fetch_failure_is_swallowed_and_rolled_back(self):
+        db = _ReconcileFakeDB(["movie:1"], _wl_conn())
+        with patch.object(sync, "async_sessionmaker", return_value=lambda *a, **k: db), \
+             patch.object(sync.plex, "get_watchlist", AsyncMock(side_effect=RuntimeError("plex down"))):
+            await sync._reconcile_plex_watchlist(1, db.conn.id, "tmdb-key")
+        db.rollback.assert_awaited()
+        self.assertEqual(db.baseline_writes, [])
+
+    async def test_disabled_flags_do_nothing(self):
+        db = _ReconcileFakeDB(["movie:1"], _wl_conn(pull=False, push=False))
+        fetch = AsyncMock()
+        with patch.object(sync, "async_sessionmaker", return_value=lambda *a, **k: db), \
+             patch.object(sync.plex, "get_watchlist", fetch):
+            await sync._reconcile_plex_watchlist(1, db.conn.id, "tmdb-key")
+        fetch.assert_not_called()
+
+
+class PushEnabledPropertyTests(unittest.TestCase):
+    """The scheduler's auto-push gate and the manual push endpoint share this
+    property, so a watchlist-only connection can't be forgotten by one of
+    them again."""
+
+    def test_watchlist_only_connection_is_push_enabled(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=False, push_ratings=False, push_playback=False,
+            plex_push_watchlist=True,
+        )
+        self.assertTrue(conn.push_enabled)
+
+    def test_no_push_flags_at_all(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=False, push_ratings=False, push_playback=False,
+            plex_push_watchlist=False,
+        )
+        self.assertFalse(conn.push_enabled)
+
+    def test_classic_push_flags_still_count(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=True, push_ratings=False, push_playback=False,
+            plex_push_watchlist=False,
+        )
+        self.assertTrue(conn.push_enabled)
+
+
+class ConnectionUpdateBaselineResetTests(unittest.IsolatedAsyncioTestCase):
+    """Flipping a watchlist direction off→on must restart from a clean
+    bootstrap - a baseline recorded under the old settings must not drive
+    deletions."""
+
+    async def _patch_connection(self, conn, **body_fields):
+        import schemas
+        from routers import auth as auth_router
+
+        db = _FakeSession(conn)
+        body = schemas.MediaServerConnectionUpdate(**body_fields)
+        return await auth_router.update_connection(
+            connection_id=1, body=body, db=db, current_user=SimpleNamespace(id=1),
+        )
+
+    def _conn(self, sync_on=False, push_on=False):
+        return MediaServerConnection(
+            id=1, user_id=1, type="plex", name="Plex", url="http://p", token="t",
+            plex_sync_watchlist=sync_on, plex_push_watchlist=push_on,
+            plex_watchlist_synced_keys=["movie:1"],
+        )
+
+    async def test_enabling_pull_resets_the_baseline(self):
+        conn = self._conn()
+        await self._patch_connection(conn, plex_sync_watchlist=True)
+        self.assertIsNone(conn.plex_watchlist_synced_keys)
+
+    async def test_enabling_push_resets_the_baseline(self):
+        conn = self._conn()
+        await self._patch_connection(conn, plex_push_watchlist=True)
+        self.assertIsNone(conn.plex_watchlist_synced_keys)
+
+    async def test_updating_while_already_enabled_keeps_the_baseline(self):
+        conn = self._conn(sync_on=True)
+        await self._patch_connection(conn, plex_sync_watchlist=True)
+        self.assertEqual(conn.plex_watchlist_synced_keys, ["movie:1"])
+
+    async def test_disabling_keeps_the_baseline(self):
+        conn = self._conn(sync_on=True)
+        await self._patch_connection(conn, plex_sync_watchlist=False)
+        self.assertEqual(conn.plex_watchlist_synced_keys, ["movie:1"])
+
+
+class ProviderAddedAtTests(unittest.TestCase):
+    """The library add-date each media server reports, normalised to naive UTC
+    like every other timestamp Scrob stores."""
+
+    def test_plex_epoch_seconds(self):
+        got = sync.provider_added_at({"addedAt": 1754179200}, sync.CollectionSource.plex)
+        self.assertEqual(got, datetime(2025, 8, 3, 0, 0, 0))
+
+    def test_plex_accepts_the_value_as_a_string(self):
+        got = sync.provider_added_at({"addedAt": "1754179200"}, sync.CollectionSource.plex)
+        self.assertEqual(got, datetime(2025, 8, 3, 0, 0, 0))
+
+    def test_jellyfin_iso_with_dotnet_fractional_seconds(self):
+        got = sync.provider_added_at(
+            {"DateCreated": "2026-08-01T09:30:00.0000000Z"}, sync.CollectionSource.jellyfin
+        )
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 30, 0))
+        self.assertIsNone(got.tzinfo)
+
+    def test_emby_iso_is_converted_to_utc(self):
+        got = sync.provider_added_at(
+            {"DateCreated": "2026-08-01T11:30:00+02:00"}, sync.CollectionSource.emby
+        )
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 30, 0))
+
+    def test_sources_without_a_library_date_return_none(self):
+        # Nuvio and Stremio items are synthesized with a fixed key set, so they
+        # must never be read as if they were a media browser payload.
+        for source in (sync.CollectionSource.nuvio, sync.CollectionSource.stremio):
+            self.assertIsNone(
+                sync.provider_added_at({"DateCreated": "2026-08-01T09:30:00Z"}, source)
+            )
+
+    def test_nuvio_uses_its_own_epoch_ms_add_time(self):
+        # 2026-08-01T09:30:00Z (#244)
+        got = sync.provider_added_at({"NuvioAddedAt": 1785576600000}, sync.CollectionSource.nuvio)
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 30, 0))
+        self.assertIsNone(sync.provider_added_at({"NuvioAddedAt": None}, sync.CollectionSource.nuvio))
+
+    def test_nuvio_library_record_forwards_added_at_but_watched_record_does_not(self):
+        record = {"content_id": "tt0111161", "content_type": "movie", "name": "X", "added_at": 1785576600000}
+        _, lib_item = sync._normalize_nuvio_item(record, 1, tmdb_id=278)
+        _, watched_item = sync._normalize_nuvio_item(record, 1, watched=True, tmdb_id=278)
+        self.assertEqual(lib_item["NuvioAddedAt"], 1785576600000)
+        self.assertIsNone(watched_item["NuvioAddedAt"])
+
+    def test_missing_or_unusable_values_return_none(self):
+        cases = [
+            ({}, sync.CollectionSource.plex),
+            ({"addedAt": None}, sync.CollectionSource.plex),
+            ({"addedAt": "not-a-number"}, sync.CollectionSource.plex),
+            ({}, sync.CollectionSource.jellyfin),
+            ({"DateCreated": ""}, sync.CollectionSource.jellyfin),
+            ({"DateCreated": "yesterday"}, sync.CollectionSource.jellyfin),
+        ]
+        for item, source in cases:
+            self.assertIsNone(sync.provider_added_at(item, source), (item, source))
+
+
+class CollectionAddedAtHealTests(unittest.TestCase):
+    """The heal has to lower Collection.added_at without ever raising it, which
+    is why the comparison happens in SQL rather than in Python."""
+
+    def test_statement_takes_the_lesser_of_stored_and_provider_dates(self):
+        rendered = str(sync.collection_added_at_heal_stmt().compile(dialect=_pg.dialect()))
+        self.assertIn("UPDATE collections SET added_at=least(collections.added_at,", rendered)
+        self.assertIn("WHERE collections.id =", rendered)
+
+
+class _HealPushEchoRow:
+    def __init__(self, id, media_id, watched_at):
+        self.id = id
+        self.media_id = media_id
+        self.watched_at = watched_at
+
+
+class _HealPushEchoResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _HealPushEchoDB:
+    """First execute() returns the ordered provisional-events query, second
+    returns the (media_id, earliest_id) grouping, any further ones (the
+    DELETE) are just recorded as no-ops."""
+
+    def __init__(self, rows, earliest_by_media):
+        self._results = [
+            _HealPushEchoResult(rows),
+            _HealPushEchoResult(list(earliest_by_media.items())),
+        ]
+        self.executed_statements = []
+        self.commit = AsyncMock()
+
+    async def execute(self, stmt):
+        self.executed_statements.append(stmt)
+        if self._results:
+            return self._results.pop(0)
+        return _HealPushEchoResult([])
+
+
+class HealPushEchoDuplicatesTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the #247/#251 cleanup heal: a burst of provisional
+    watch events created by a Jellyfin/Emby mark-watched push echoing back as
+    a webhook, on top of whatever real watch record already existed (that's
+    the only reason the item was being pushed at all)."""
+
+    async def test_burst_of_duplicates_for_already_watched_items_is_healed(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        # 5 provisional completions 10s apart, media 101..105 - each already
+        # has an earlier (non-burst) watch event, i.e. a lower id than these.
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(5)]
+        earliest_by_media = {101 + i: 1 + i for i in range(5)}  # all pre-date the burst ids
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 5)
+        db.commit.assert_awaited_once()
+
+    async def test_burst_below_the_size_threshold_is_left_alone(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(3)]
+        earliest_by_media = {101 + i: 1 + i for i in range(3)}
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_a_titles_only_ever_recorded_watch_is_never_deleted_even_in_a_large_burst(self):
+        # Simulates marking a whole season watched from Jellyfin's own UI -
+        # also produces a burst of provisional TogglePlayed webhooks, but each
+        # one is a genuinely first-time watch and must survive the heal.
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(6)]
+        earliest_by_media = {101 + i: 1000 + i for i in range(6)}  # each IS its own earliest record
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_a_mixed_burst_only_removes_the_actual_duplicates(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(5)]
+        earliest_by_media = {101: 1000, 102: 5, 103: 1002, 104: 8, 105: 1004}  # 101, 103, 105 are their own earliest
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 2)  # only media 102 and 104
+
+    async def test_events_far_apart_never_cluster_into_a_burst(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        # 6 events, each an hour apart - well past BURST_GAP, so no cluster
+        # ever reaches BURST_MIN_SIZE even though the total count would.
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(hours=i)) for i in range(6)]
+        earliest_by_media = {101 + i: 1 + i for i in range(6)}
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_no_provisional_events_short_circuits_without_further_queries(self):
+        db = _HealPushEchoDB([], {})
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 0})
+        self.assertEqual(len(db.executed_statements), 1)
+
+
+class _HealStuckUnwatchedDB:
+    def __init__(self, ids):
+        self._results = [_HealPushEchoResult([(i,) for i in ids])]
+        self.executed_statements = []
+        self.commit = AsyncMock()
+
+    async def execute(self, stmt):
+        self.executed_statements.append(stmt)
+        if self._results:
+            return self._results.pop(0)
+        return _HealPushEchoResult([])
+
+
+class HealStuckUnwatchedTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the #253 cleanup heal: a WatchEvent stuck as
+    completed=False (Jellyfin/Emby reporting PlayCount > 0 with Played still
+    False) used to block every later sync from ever recording the real
+    completion once it happened."""
+
+    async def test_matching_rows_are_healed(self):
+        db = _HealStuckUnwatchedDB([10, 11, 12])
+        result = await sync.heal_stuck_unwatched(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 3})
+        db.commit.assert_awaited_once()
+
+    async def test_no_matches_short_circuits_without_delete_or_commit(self):
+        db = _HealStuckUnwatchedDB([])
+        result = await sync.heal_stuck_unwatched(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 0})
+        self.assertEqual(len(db.executed_statements), 1)
+        db.commit.assert_not_awaited()
+
+
+class _MarkJobRunningResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class MarkJobRunningUnlessCancelledTests(unittest.IsolatedAsyncioTestCase):
+    """Live-testing follow-up: every _run_*_sync entry point (Jellyfin, Emby,
+    Plex, Nuvio, Stremio, ARVIO, and the full push) shares one global
+    _sync_semaphore - only one sync runs across the whole instance at a
+    time - so a job can sit pending for a while, queued behind another one.
+    If it's cancelled while still queued, the first write that flips it to
+    running must not silently resurrect it. Confirmed live: a cancel-while-
+    queued Jellyfin pull ended up stuck running with a stale "Cancelled by
+    user" error_message next to it, because that write had no WHERE on the
+    job's current status."""
+
+    async def _run(self, matched: bool, **values):
+        captured: list = []
+
+        async def execute(stmt):
+            captured.append(stmt)
+            return _MarkJobRunningResult(42 if matched else None)
+
+        db = SimpleNamespace(execute=execute, commit=AsyncMock())
+        started = await sync._mark_job_running_unless_cancelled(db, 42, **values)
+        return started, db, captured[0]
+
+    async def test_statement_only_matches_a_still_pending_job(self):
+        _, _, stmt = await self._run(matched=True)
+        compiled = str(stmt)
+        self.assertIn("sync_jobs.id", compiled)
+        self.assertIn("sync_jobs.status", compiled)
+        # Both id and status must be in the WHERE - a bare id match (the old
+        # behavior) would let this stomp a job regardless of its status.
+        self.assertIn("AND", compiled)
+
+    async def test_pending_job_transitions_to_running(self):
+        started, db, _ = await self._run(matched=True, current_step="Pulling library")
+        self.assertTrue(started)
+        db.commit.assert_awaited_once()
+
+    async def test_already_cancelled_job_is_left_alone(self):
+        # The UPDATE matched zero rows (status was already 'cancelled', not
+        # 'pending') - the row is untouched, and the caller must bail out
+        # rather than proceed as if the job had started normally.
+        started, db, _ = await self._run(matched=False)
+        self.assertFalse(started)
+        db.commit.assert_awaited_once()
+
+
+class _PartialWatchDB(unittest.IsolatedAsyncioTestCase):
+    """SQLite harness for the tests below - the bug they guard against was in
+    a WHERE clause, so these run the real queries instead of a fake."""
+
+    async def asyncSetUp(self):
+        import models  # noqa: F401 - registers every table on Base.metadata
+        from models.base import Base
+
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+        )
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.addAsyncCleanup(self.engine.dispose)
+
+
+class SyncItemsPartialWatchFanOutTests(_PartialWatchDB):
+    """Regression tests: a started-but-unfinished Jellyfin/Emby play (#253)
+    is recorded as completed=False, and passing it to the push fan-out marked
+    the item fully watched on every other target."""
+
+    async def _sync_one_movie(self, user_data: dict) -> tuple[set[int], "WatchEvent"]:
+        from models.collection import Collection, CollectionFile, CollectionSource
+        from models.events import WatchEvent
+        from models.media import Media, MediaType
+
+        async with self.Session() as db:
+            media = Media(tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
+            db.add(media)
+            await db.flush()
+            coll = Collection(user_id=1, media_id=media.id)
+            db.add(coll)
+            await db.flush()
+            db.add(CollectionFile(
+                collection_id=coll.id, connection_id=7,
+                source=CollectionSource.jellyfin, source_id="jf-1",
+            ))
+            await db.commit()
+            media_id = media.id
+
+            new_watched_ids: set[int] = set()
+            await sync.sync_items(
+                items=[{
+                    "Id": "jf-1",
+                    "Name": "The Matrix",
+                    "ProviderIds": {"Tmdb": "603"},
+                    "UserData": user_data,
+                }],
+                media_type=MediaType.movie,
+                source=CollectionSource.jellyfin,
+                db=db,
+                stats={"movies": 0, "episodes": 0, "skipped": 0, "errors": 0},
+                user_id=1,
+                connection_id=7,
+                new_watched_ids=new_watched_ids,
+            )
+
+            events = (await db.execute(
+                select(WatchEvent).where(WatchEvent.media_id == media_id)
+            )).scalars().all()
+            self.assertEqual(len(events), 1)
+            return new_watched_ids, events[0]
+
+    async def test_a_started_item_is_recorded_but_never_fanned_out(self):
+        new_watched_ids, event = await self._sync_one_movie(
+            {"Played": False, "PlayCount": 1, "LastPlayedDate": "2026-01-02T20:00:00.000Z"}
+        )
+        # Still recorded locally (Next Up and the #253 healing need it),
+        # just not pushed anywhere.
+        self.assertFalse(event.completed)
+        self.assertEqual(new_watched_ids, set())
+
+    async def test_a_finished_item_still_fans_out(self):
+        new_watched_ids, event = await self._sync_one_movie(
+            {"Played": True, "PlayCount": 1, "LastPlayedDate": "2026-01-02T20:00:00.000Z"}
+        )
+        self.assertTrue(event.completed)
+        self.assertEqual(new_watched_ids, {event.media_id})
+
+
+class SyncItemsPushBackTests(_PartialWatchDB):
+    """#420: a title marked watched in Scrob before it was collected shows up
+    on the server unwatched - sync_items hands it back for a push there."""
+
+    async def _sync_movie(self, *, watched_in_scrob: bool, user_data: dict, file_known: bool = False) -> tuple[dict, int]:
+        from models.collection import Collection, CollectionFile, CollectionSource
+        from models.events import WatchEvent
+        from models.media import Media, MediaType
+
+        async with self.Session() as db:
+            media = Media(tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
+            db.add(media)
+            await db.flush()
+            if watched_in_scrob:
+                db.add(WatchEvent(
+                    user_id=1, media_id=media.id, completed=True, play_count=1,
+                    watched_at=datetime(2024, 5, 1, 12, 0, 0),
+                ))
+            if file_known:
+                coll = Collection(user_id=1, media_id=media.id)
+                db.add(coll)
+                await db.flush()
+                db.add(CollectionFile(
+                    collection_id=coll.id, connection_id=7,
+                    source=CollectionSource.jellyfin, source_id="jf-1",
+                ))
+            await db.commit()
+
+            push_back: dict[int, str] = {}
+            await sync.sync_items(
+                items=[{
+                    "Id": "jf-1", "Name": "The Matrix",
+                    "ProviderIds": {"Tmdb": "603"}, "UserData": user_data,
+                }],
+                media_type=MediaType.movie,
+                source=CollectionSource.jellyfin,
+                db=db,
+                stats={"movies": 0, "episodes": 0, "skipped": 0, "errors": 0},
+                user_id=1,
+                connection_id=7,
+                push_back=push_back,
+            )
+            return push_back, media.id
+
+    async def test_newly_collected_watched_item_is_handed_back(self):
+        push_back, media_id = await self._sync_movie(watched_in_scrob=True, user_data={"Played": False})
+        self.assertEqual(push_back, {media_id: "jf-1"})
+
+    async def test_already_watched_on_the_server_is_not(self):
+        push_back, _ = await self._sync_movie(
+            watched_in_scrob=True,
+            user_data={"Played": True, "PlayCount": 1, "LastPlayedDate": "2026-01-02T20:00:00.000Z"},
+        )
+        self.assertEqual(push_back, {})
+
+    async def test_unwatched_in_scrob_is_not(self):
+        push_back, _ = await self._sync_movie(watched_in_scrob=False, user_data={"Played": False})
+        self.assertEqual(push_back, {})
+
+    async def test_an_already_collected_file_is_not(self):
+        push_back, _ = await self._sync_movie(
+            watched_in_scrob=True, user_data={"Played": False}, file_known=True,
+        )
+        self.assertEqual(push_back, {})
+
+
+class SyncItemsSkippedItemProgressTests(_PartialWatchDB):
+    """An unmatched item that can't be stored as a stub is skipped. If it was the
+    last one of a batch, the skip jumped over the batch bookkeeping and that
+    whole batch never reached processed_items - the job ended below 100%."""
+
+    async def test_skipped_item_at_a_batch_boundary_still_counts_the_batch(self):
+        from models.collection import CollectionSource
+        from models.media import MediaType
+        from models.sync import SyncJob
+
+        # No TMDB id and no name: unmatched, and too little to store a stub.
+        items = [{"Id": f"jf-{n}", "ProviderIds": {}} for n in range(3)]
+        async with self.Session() as db:
+            job = SyncJob(user_id=1, source=CollectionSource.jellyfin, total_items=len(items), processed_items=0)
+            db.add(job)
+            await db.commit()
+
+            stats = {"movies": 0, "episodes": 0, "skipped": 0, "errors": 0}
+            with patch.object(sync, "BATCH_SIZE", 2):
+                await sync.sync_items(
+                    items=items,
+                    media_type=MediaType.movie,
+                    source=CollectionSource.jellyfin,
+                    db=db,
+                    stats=stats,
+                    user_id=1,
+                    job_id=job.id,
+                    connection_id=7,
+                )
+
+            await db.refresh(job)
+            self.assertEqual(stats["skipped"], 3)
+            self.assertEqual(stats["errors"], 0)
+            self.assertEqual((job.processed_items, job.total_items), (3, 3))
+
+
+class SyncRowCountMatchesProcessedTests(_PartialWatchDB):
+    """Jellyfin/Emby pulls size the job's total_items with _sync_row_count while
+    sync_items counts processed_items per expanded row (#138). Sized by
+    len(items) instead, a library with combined files finished above 100%
+    (e.g. 49052 / 48532)."""
+
+    async def test_job_sized_by_row_count_ends_at_its_total(self):
+        from models.collection import CollectionSource
+        from models.media import MediaType
+        from models.sync import SyncJob
+
+        items = [
+            {"Id": "file-1", "SeriesId": "s-1", "ParentIndexNumber": 1, "IndexNumber": 1, "IndexNumberEnd": 3},
+            {"Id": "file-2", "SeriesId": "s-1", "ParentIndexNumber": 1, "IndexNumber": 4},
+        ]
+        total = sync._sync_row_count(items, MediaType.episode, CollectionSource.jellyfin)
+        async with self.Session() as db:
+            job = SyncJob(user_id=1, source=CollectionSource.jellyfin, total_items=total, processed_items=0)
+            db.add(job)
+            await db.commit()
+
+            await sync.sync_items(
+                items=items,
+                media_type=MediaType.episode,
+                source=CollectionSource.jellyfin,
+                db=db,
+                stats={"movies": 0, "episodes": 0, "skipped": 0, "errors": 0},
+                user_id=1,
+                job_id=job.id,
+                connection_id=7,
+            )
+
+            await db.refresh(job)
+            self.assertEqual((job.processed_items, job.total_items), (4, 4))
+
+    async def test_sync_items_leaves_the_jobs_running_total_alone(self):
+        """The pull sizes total_items across every library and step, and
+        processed_items accumulates across sync_items calls, so one call must
+        not overwrite the total with its own row count (it ended at 10 / 4)."""
+        from models.collection import CollectionSource
+        from models.media import MediaType
+        from models.sync import SyncJob
+
+        items = [
+            {"Id": "file-1", "SeriesId": "s-1", "ParentIndexNumber": 1, "IndexNumber": 1, "IndexNumberEnd": 3},
+            {"Id": "file-2", "SeriesId": "s-1", "ParentIndexNumber": 1, "IndexNumber": 4},
+        ]
+        async with self.Session() as db:
+            # 6 movies already processed; 6 + 4 episode rows planned in total.
+            job = SyncJob(user_id=1, source=CollectionSource.jellyfin, total_items=10, processed_items=6)
+            db.add(job)
+            await db.commit()
+
+            await sync.sync_items(
+                items=items,
+                media_type=MediaType.episode,
+                source=CollectionSource.jellyfin,
+                db=db,
+                stats={"movies": 0, "episodes": 0, "skipped": 0, "errors": 0},
+                user_id=1,
+                job_id=job.id,
+                connection_id=7,
+            )
+
+            await db.refresh(job)
+            self.assertEqual((job.processed_items, job.total_items), (10, 10))
+
+
+class PushWatchedBackToSourceTests(_PartialWatchDB):
+    def _conn(self, type_="jellyfin", push_watched=True):
+        return SimpleNamespace(
+            type=type_, push_watched=push_watched, url="http://srv", token="t", server_user_id="u1",
+        )
+
+    async def _run(self, conn, push_back):
+        with (
+            patch.object(sync, "_latest_watched_at", AsyncMock(return_value={1: datetime(2024, 5, 1, 12, 0, 0)})),
+            patch("core.jellyfin.mark_watched", AsyncMock(return_value=True)) as mark,
+            patch.object(sync, "_push_plex_watched_and_record", AsyncMock(return_value=True)) as plex_push,
+        ):
+            count = await sync._push_watched_back_to_source(None, 1, conn, push_back)
+        return count, mark, plex_push
+
+    async def test_jellyfin_gets_the_original_date(self):
+        count, mark, _ = await self._run(self._conn(), {1: "jf-1"})
+        self.assertEqual(count, 1)
+        self.assertEqual(mark.await_args.kwargs["played_at"], datetime(2024, 5, 1, 12, 0, 0))
+
+    async def test_plex_goes_through_the_pending_push_recorder(self):
+        count, _, plex_push = await self._run(self._conn("plex"), {1: "rk-1"})
+        self.assertEqual(count, 1)
+        plex_push.assert_awaited_once()
+
+    async def test_push_watched_off_pushes_nothing(self):
+        count, mark, plex_push = await self._run(self._conn(push_watched=False), {1: "jf-1"})
+        self.assertEqual(count, 0)
+        mark.assert_not_awaited()
+        plex_push.assert_not_awaited()
+
+    async def test_multi_episode_file_is_pushed_once(self):
+        count, mark, _ = await self._run(self._conn(), {1: "jf-1", 2: "jf-1"})
+        self.assertEqual(count, 1)
+        mark.assert_awaited_once()
+
+
+class FullPushPartialWatchTests(_PartialWatchDB):
+    """Same bug on the manual push path, which read every WatchEvent as
+    watched regardless of completed."""
+
+    async def _seed(self) -> tuple[int, int]:
+        from models.collection import Collection, CollectionFile, CollectionSource
+        from models.events import WatchEvent
+        from models.media import Media, MediaType
+        from models.sync import SyncJob, SyncStatus
+
+        async with self.Session() as db:
+            conn = MediaServerConnection(
+                user_id=1, type="jellyfin", name="Jellyfin", url="http://jf", token="tok",
+                server_user_id="jf-user", push_watched=True,
+            )
+            db.add(conn)
+            await db.flush()
+            job = SyncJob(
+                user_id=1, source=CollectionSource.jellyfin, status=SyncStatus.pending,
+                connection_id=conn.id, job_type="push",
+            )
+            db.add(job)
+            finished = Media(tmdb_id=603, media_type=MediaType.movie, title="Finished")
+            started = Media(tmdb_id=604, media_type=MediaType.movie, title="Started")
+            db.add_all([finished, started])
+            await db.flush()
+            for media, source_id in ((finished, "jf-finished"), (started, "jf-started")):
+                coll = Collection(user_id=1, media_id=media.id)
+                db.add(coll)
+                await db.flush()
+                db.add(CollectionFile(
+                    collection_id=coll.id, connection_id=conn.id,
+                    source=CollectionSource.jellyfin, source_id=source_id,
+                ))
+            db.add(WatchEvent(
+                user_id=1, media_id=finished.id, watched_at=datetime(2026, 1, 1),
+                completed=True, play_count=1, progress_percent=1.0,
+            ))
+            db.add(WatchEvent(
+                user_id=1, media_id=started.id, watched_at=datetime(2026, 1, 2),
+                completed=False, play_count=1, progress_percent=0.0,
+            ))
+            await db.commit()
+            self.finished_media_id = finished.id
+            self.started_media_id = started.id
+            return conn.id, job.id
+
+    async def _push(self):
+        connection_id, job_id = await self._seed()
+        mark_watched = AsyncMock(return_value=True)
+        # Neither is played on the server (the started one only has a resume
+        # position), so the #302 check waves both through.
+        watched_state = AsyncMock(return_value={"jf-finished": False, "jf-started": False})
+        with patch.object(sync, "engine", self.engine), \
+             patch.object(sync.jellyfin, "mark_watched", mark_watched), \
+             patch.object(sync.jellyfin, "get_items_watched_state", watched_state), \
+             patch("routers.webhooks.mark_pushed_watched") as mark_pushed:
+            await sync._run_full_push(1, connection_id, job_id)
+        return mark_watched, mark_pushed, job_id
+
+    async def _job(self, job_id: int):
+        from models.sync import SyncJob
+
+        async with self.Session() as db:
+            return (await db.execute(select(SyncJob).where(SyncJob.id == job_id))).scalar_one()
+
+    async def test_only_the_finished_item_is_pushed(self):
+        mark_watched, _, job_id = await self._push()
+        pushed_source_ids = [call.args[3] for call in mark_watched.await_args_list]
+        self.assertEqual(pushed_source_ids, ["jf-finished"])
+        job = await self._job(job_id)
+        self.assertEqual(job.status.value, "completed")
+        self.assertEqual(job.total_items, 1)
+        self.assertEqual(job.stats, {"succeeded": 1, "failed": 0, "skipped": 0, "mode": "full"})
+
+    async def test_no_echo_token_is_armed_for_the_started_item(self):
+        # An armed token swallows the item's next webhook as a push echo
+        # (#247/#251).
+        _, mark_pushed, _ = await self._push()
+        armed_media_ids = [call.args[1] for call in mark_pushed.call_args_list]
+        self.assertEqual(armed_media_ids, [self.finished_media_id])
+
+
+class FullPushTvdbOnlyServerSeriesTests(_PartialWatchDB):
+    """#429: a show Scrob knows by both TMDB and TVDB ids was reported "not
+    found on this server" when the Jellyfin/Emby series only carries a TVDB
+    provider id - the TVDB-keyed index was only built for shows with no TMDB id."""
+
+    async def _seed(self) -> tuple[int, int]:
+        from models.collection import CollectionSource
+        from models.events import WatchEvent
+        from models.media import Media, MediaType
+        from models.show import Show
+        from models.sync import SyncJob, SyncStatus
+
+        async with self.Session() as db:
+            conn = MediaServerConnection(
+                user_id=1, type="jellyfin", name="Jellyfin", url="http://jf", token="tok",
+                server_user_id="jf-user", push_watched=True,
+            )
+            db.add(conn)
+            await db.flush()
+            job = SyncJob(
+                user_id=1, source=CollectionSource.jellyfin, status=SyncStatus.pending,
+                connection_id=conn.id, job_type="push",
+            )
+            show = Show(tmdb_id=71446, tvdb_id=327417, title="Money Heist")
+            db.add_all([job, show])
+            await db.flush()
+            episode = Media(
+                tmdb_id=1234, media_type=MediaType.episode, title="Pilot",
+                show_id=show.id, season_number=1, episode_number=1,
+            )
+            db.add(episode)
+            await db.flush()
+            db.add(WatchEvent(
+                user_id=1, media_id=episode.id, watched_at=datetime(2026, 1, 1),
+                completed=True, play_count=1, progress_percent=1.0,
+            ))
+            await db.commit()
+            return conn.id, job.id
+
+    async def test_series_known_to_the_server_only_by_tvdb_id_is_found(self):
+        connection_id, job_id = await self._seed()
+        mark_watched = AsyncMock(return_value=True)
+        with patch.object(sync, "engine", self.engine), \
+             patch.object(sync.jellyfin, "build_tmdb_index", AsyncMock(return_value={})), \
+             patch.object(sync.jellyfin, "build_tvdb_index", AsyncMock(return_value={327417: "series-jf"})), \
+             patch.object(sync.jellyfin, "find_episode_in_series", AsyncMock(return_value={"Id": "ep-jf"})), \
+             patch.object(sync.jellyfin, "get_items_watched_state", AsyncMock(return_value={"ep-jf": False})), \
+             patch.object(sync.jellyfin, "mark_watched", mark_watched), \
+             patch("routers.webhooks.mark_pushed_watched"):
+            await sync._run_full_push(1, connection_id, job_id)
+        self.assertEqual([call.args[3] for call in mark_watched.await_args_list], ["ep-jf"])
+
+
+class FullPushEchoTokenTimingTests(_PartialWatchDB):
+    """#372: the push-echo token is armed in _push_watched_group, right
+    before the mark_watched call - not once for the whole job up front,
+    where a large-library push runs past the token's 10-minute TTL and its
+    own echo comes back unprotected. A side effect of moving it: an item the
+    server already shows as watched (the push is skipped) no longer leaves a
+    stray token behind."""
+
+    async def _seed(self) -> tuple[int, int]:
+        from models.collection import Collection, CollectionFile, CollectionSource
+        from models.events import WatchEvent
+        from models.media import Media, MediaType
+        from models.sync import SyncJob, SyncStatus
+
+        async with self.Session() as db:
+            conn = MediaServerConnection(
+                user_id=1, type="jellyfin", name="Jellyfin", url="http://jf", token="tok",
+                server_user_id="jf-user", push_watched=True,
+            )
+            db.add(conn)
+            await db.flush()
+            job = SyncJob(
+                user_id=1, source=CollectionSource.jellyfin, status=SyncStatus.pending,
+                connection_id=conn.id, job_type="push",
+            )
+            db.add(job)
+            new_on_server = Media(tmdb_id=603, media_type=MediaType.movie, title="New on server")
+            already_on_server = Media(tmdb_id=604, media_type=MediaType.movie, title="Already on server")
+            db.add_all([new_on_server, already_on_server])
+            await db.flush()
+            for media, source_id in ((new_on_server, "jf-new"), (already_on_server, "jf-already")):
+                coll = Collection(user_id=1, media_id=media.id)
+                db.add(coll)
+                await db.flush()
+                db.add(CollectionFile(
+                    collection_id=coll.id, connection_id=conn.id,
+                    source=CollectionSource.jellyfin, source_id=source_id,
+                ))
+                db.add(WatchEvent(
+                    user_id=1, media_id=media.id, watched_at=datetime(2026, 1, 1),
+                    completed=True, play_count=1, progress_percent=1.0,
+                ))
+            await db.commit()
+            self.new_media_id = new_on_server.id
+            self.already_media_id = already_on_server.id
+            return conn.id, job.id
+
+    async def test_token_armed_only_when_the_push_actually_fires(self):
+        connection_id, job_id = await self._seed()
+        mark_watched = AsyncMock(return_value=True)
+        watched_state = AsyncMock(return_value={"jf-new": False, "jf-already": True})
+        with patch.object(sync, "engine", self.engine), \
+             patch.object(sync.jellyfin, "mark_watched", mark_watched), \
+             patch.object(sync.jellyfin, "get_items_watched_state", watched_state), \
+             patch("routers.webhooks.mark_pushed_watched") as mark_pushed:
+            await sync._run_full_push(1, connection_id, job_id)
+
+        pushed_source_ids = [call.args[3] for call in mark_watched.await_args_list]
+        self.assertEqual(pushed_source_ids, ["jf-new"])
+        armed_media_ids = [call.args[1] for call in mark_pushed.call_args_list]
+        self.assertEqual(armed_media_ids, [self.new_media_id])
+
+
+class WatchedLookupFailedWarningTests(unittest.TestCase):
+    """#304: push lookup misses must carry reason + media_type so Connections
+    does not render them as unmatched TMDB (unknown reason, Match-as-show)."""
+
+    def test_copies_title_and_media_type_value(self):
+        for media_type in (sync.MediaType.movie, sync.MediaType.episode):
+            with self.subTest(media_type=media_type):
+                media = SimpleNamespace(title="Any Title", media_type=media_type)
+                self.assertEqual(
+                    sync.watched_lookup_failed_warning(1, media),
+                    {
+                        "type": "watched_lookup_failed",
+                        "media_id": 1,
+                        "title": "Any Title",
+                        "media_type": media_type.value,
+                        "series_name": None,
+                        "reason": sync.WATCHED_LOOKUP_FAILED_REASON,
+                    },
+                )
+
+    def test_missing_media_still_has_type_and_reason(self):
+        warning = sync.watched_lookup_failed_warning(1, None)
+        self.assertEqual(warning["type"], "watched_lookup_failed")
+        self.assertEqual(warning["media_id"], 1)
+        self.assertIsNone(warning["title"])
+        self.assertIsNone(warning["media_type"])
+        self.assertIsNone(warning["series_name"])
+        self.assertEqual(warning["reason"], sync.WATCHED_LOOKUP_FAILED_REASON)
+
+    def test_series_name_only_carried_for_episodes(self):
+        # #400: lets Connections group these by show - a movie has no show to
+        # group under, so series_name must stay None even if one is passed.
+        movie = SimpleNamespace(title="A Movie", media_type=sync.MediaType.movie)
+        self.assertIsNone(sync.watched_lookup_failed_warning(1, movie, series_name="Some Show")["series_name"])
+
+        episode = SimpleNamespace(title="Pilot", media_type=sync.MediaType.episode)
+        self.assertEqual(
+            sync.watched_lookup_failed_warning(1, episode, series_name="Some Show")["series_name"],
+            "Some Show",
+        )
+
+
+class PushFailedWarningTests(unittest.TestCase):
+    """A full push names every item it could not send and why, instead of
+    only counting them in stats.failed."""
+
+    def test_carries_action_reason_and_series_for_episodes(self):
+        episode = SimpleNamespace(title="Pilot", media_type=sync.MediaType.episode)
+        self.assertEqual(
+            sync.push_failed_warning(7, episode, "rating", "Not in Plex", series_name="Some Show"),
+            {
+                "type": "push_failed",
+                "media_id": 7,
+                "title": "Pilot",
+                "media_type": "episode",
+                "series_name": "Some Show",
+                "action": "rating",
+                "reason": "Not in Plex",
+            },
+        )
+
+    def test_series_name_dropped_for_movies_and_missing_media(self):
+        movie = SimpleNamespace(title="A Movie", media_type=sync.MediaType.movie)
+        self.assertIsNone(sync.push_failed_warning(1, movie, "watched", "x", series_name="Show")["series_name"])
+        warning = sync.push_failed_warning(1, None, "watched", "x")
+        self.assertIsNone(warning["title"])
+        self.assertIsNone(warning["media_type"])
+
+
+class MatchUnmatchedShowDisplacedTmdbIdTests(_PartialWatchDB):
+    """match-unmatched-show 500: when the TMDB pick cross-references an
+    existing TVDB-matched show, the endpoint hands that show the TMDB id and
+    NULLs it on whatever stale show held it. Both writes used to stay pending
+    until the first episode flush, which emits them in primary-key order - so
+    when the target show sorts first it tripped shows_tmdb_id_key while the
+    stale row still held the value."""
+
+    async def _seed(self):
+        from models.collection import Collection
+        from models.global_settings import GlobalSettings
+        from models.media import Media, MediaType
+        from models.show import Show
+
+        async with self.Session() as db:
+            db.add(GlobalSettings(id=1, tmdb_api_key="k"))
+            # Inserted first so it gets the lower primary key and sorts ahead
+            # of the displaced row in the flush.
+            target = Show(tvdb_id=555, title="Murder Mystery Dinner Party (TVDB)")
+            db.add(target)
+            await db.flush()
+            displaced = Show(tmdb_id=327463, title="Murder Mystery Dinner Party (stale TMDB)")
+            db.add(displaced)
+            await db.flush()
+
+            old_ep = Media(
+                media_type=MediaType.episode, show_id=displaced.id, tmdb_id=111,
+                season_number=1, episode_number=1, title="Already matched ep",
+            )
+            db.add(old_ep)
+            await db.flush()
+            db.add(Collection(user_id=1, media_id=old_ep.id))
+
+            unmatched = Media(
+                media_type=MediaType.episode, tmdb_id=None, show_id=None,
+                season_number=1, episode_number=2, title="Unmatched ep",
+                tmdb_data={"show_title": "Edgar Allan Poe's Murder Mystery Dinner Party"},
+            )
+            db.add(unmatched)
+            await db.flush()
+            db.add(Collection(user_id=1, media_id=unmatched.id))
+            await db.commit()
+            return target.id, displaced.id, unmatched.id, old_ep.id
+
+    async def test_target_show_gets_the_tmdb_id_without_colliding(self):
+        target_id, displaced_id, unmatched_id, old_ep_id = await self._seed()
+
+        show_data = {
+            "name": "Edgar Allan Poe's Murder Mystery Dinner Party",
+            "original_name": "Edgar Allan Poe's Murder Mystery Dinner Party",
+            "overview": "o", "poster_path": "/p.jpg", "backdrop_path": "/b.jpg",
+            "vote_average": 7.0, "status": "Ended", "tagline": "",
+            "first_air_date": "2016-01-01", "last_air_date": "2016-01-02",
+            "genres": [{"name": "Comedy"}],
+            "seasons": [{"season_number": 1, "name": "Season 1", "episode_count": 2}],
+            "external_ids": {"tvdb_id": 555},
+        }
+        season_data = {"episodes": [
+            {"episode_number": 2, "id": 424242, "name": "Matched ep",
+             "overview": "x", "still_path": None, "air_date": "2016-01-02",
+             "vote_average": 7.0, "runtime": 22},
+        ]}
+
+        body = sync.MatchUnmatchedBody(
+            show_title="Edgar Allan Poe's Murder Mystery Dinner Party", tmdb_id=327463,
+        )
+        current_user = SimpleNamespace(id=1)
+
+        with patch.object(sync.tmdb, "get_show", AsyncMock(return_value=show_data)), \
+             patch.object(sync.tmdb, "get_season", AsyncMock(return_value=season_data)):
+            async with self.Session() as db:
+                result = await sync.match_unmatched_show(body, db, current_user)
+
+        self.assertEqual(result["matched"], 1)
+
+        from models.media import Media
+        from models.show import Show
+
+        async with self.Session() as db:
+            target = await db.get(Show, target_id)
+            displaced = await db.get(Show, displaced_id)
+            unmatched = await db.get(Media, unmatched_id)
+            old_ep = await db.get(Media, old_ep_id)
+
+        self.assertEqual(target.tmdb_id, 327463)
+        self.assertIsNone(displaced.tmdb_id)
+        self.assertEqual(unmatched.show_id, target_id)
+        self.assertEqual(unmatched.tmdb_id, 424242)
+        # The stale show's own episode is re-homed, not orphaned.
+        self.assertEqual(old_ep.show_id, target_id)
+
+    async def test_two_library_versions_of_an_episode_end_up_on_one_row(self):
+        """A user with a colour and a B&W library of the same show has a stub
+        row per version for each episode. Only one can carry the episode's
+        tmdb_id, so the match folds the second stub's file onto the shared row
+        instead of leaving that version listed as unmatched."""
+        from models.collection import Collection, CollectionFile, CollectionSource
+        from models.global_settings import GlobalSettings
+        from models.media import Media, MediaType
+        from models.show import Show
+        from sqlalchemy import func
+
+        # The partial unique that forces the fold lives in a migration, not on
+        # the model - recreate it on the harness DB.
+        async with self.engine.begin() as conn:
+            await conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_media_tmdb_type ON media (tmdb_id, media_type) "
+                "WHERE tmdb_id IS NOT NULL"
+            )
+
+        async with self.Session() as db:
+            db.add(GlobalSettings(id=1, tmdb_api_key="k"))
+            db.add(Show(tmdb_id=327463, title="Murder Mystery Dinner Party"))
+            await db.flush()
+
+            colour = Media(
+                media_type=MediaType.episode, tmdb_id=None, show_id=None,
+                season_number=1, episode_number=1, title="Ep 1 (colour stub)",
+                tmdb_data={"show_title": "Edgar Allan Poe's Murder Mystery Dinner Party"},
+            )
+            bw = Media(
+                media_type=MediaType.episode, tmdb_id=None, show_id=None,
+                season_number=1, episode_number=1, title="Ep 1 (B&W stub)",
+                tmdb_data={"show_title": "Edgar Allan Poe's Murder Mystery Dinner Party"},
+            )
+            db.add_all([colour, bw])
+            await db.flush()
+            colour_coll = Collection(user_id=1, media_id=colour.id)
+            bw_coll = Collection(user_id=1, media_id=bw.id)
+            db.add_all([colour_coll, bw_coll])
+            await db.flush()
+            db.add_all([
+                CollectionFile(collection_id=colour_coll.id, source=CollectionSource.plex, source_id="rk-colour"),
+                CollectionFile(collection_id=bw_coll.id, source=CollectionSource.plex, source_id="rk-bw"),
+            ])
+            await db.commit()
+            bw_id = bw.id
+
+        show_data = {
+            "name": "Edgar Allan Poe's Murder Mystery Dinner Party",
+            "original_name": "Edgar Allan Poe's Murder Mystery Dinner Party",
+            "overview": "o", "poster_path": None, "backdrop_path": None,
+            "genres": [], "seasons": [{"season_number": 1, "episode_count": 1}],
+            "external_ids": {},
+        }
+        season_data = {"episodes": [
+            {"episode_number": 1, "id": 555001, "name": "Ep 1", "overview": "",
+             "still_path": None, "air_date": "2016-01-01", "vote_average": 7.0, "runtime": 22},
+        ]}
+
+        body = sync.MatchUnmatchedBody(
+            show_title="Edgar Allan Poe's Murder Mystery Dinner Party", tmdb_id=327463,
+        )
+        with patch.object(sync.tmdb, "get_show", AsyncMock(return_value=show_data)), \
+             patch.object(sync.tmdb, "get_season", AsyncMock(return_value=season_data)):
+            async with self.Session() as db:
+                await sync.match_unmatched_show(body, db, SimpleNamespace(id=1))
+
+        async with self.Session() as db:
+            rows = (await db.execute(
+                select(Media).where(Media.tmdb_id == 555001, Media.media_type == MediaType.episode)
+            )).scalars().all()
+            self.assertEqual(len(rows), 1)
+            shared = rows[0]
+
+            coll = (await db.execute(
+                select(Collection).where(Collection.user_id == 1, Collection.media_id == shared.id)
+            )).scalar_one()
+            files = (await db.execute(
+                select(CollectionFile.source_id).where(CollectionFile.collection_id == coll.id)
+            )).scalars().all()
+            self.assertEqual(sorted(files), ["rk-bw", "rk-colour"])
+
+            # The folded-in stub and its now-empty collection are gone.
+            self.assertIsNone(await db.get(Media, bw_id))
+            leftover = (await db.execute(
+                select(func.count(Collection.id)).where(Collection.user_id == 1)
+            )).scalar()
+            self.assertEqual(leftover, 1)
+
+
+class CanonicalEpisodePositionTests(unittest.TestCase):
+    """#447: pull sync resolves a Jellyfin/Emby episode through its TVDB episode
+    id instead of trusting the server's own season/episode numbers."""
+
+    POSITIONS = {(100, 4562021): (2, 79)}
+
+    def _item(self, **over):
+        item = {"ParentIndexNumber": 2, "IndexNumber": 21, "ProviderIds": {"Tvdb": "4562021"}}
+        item.update(over)
+        return item
+
+    def test_translates_on_an_exact_episode_id_match(self):
+        self.assertEqual(sync._canonical_episode_position(
+            self._item(), sync.CollectionSource.jellyfin, 100, self.POSITIONS
+        ), (2, 79))
+
+    def test_keeps_raw_numbers_without_a_tvdb_episode_id(self):
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(ProviderIds={"Tmdb": "5"}), sync.CollectionSource.jellyfin, 100, self.POSITIONS
+        ))
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(ProviderIds=None), sync.CollectionSource.jellyfin, 100, self.POSITIONS
+        ))
+
+    def test_never_matches_by_numbers_or_across_series(self):
+        # same raw numbers, different episode id: not the mapped episode
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(ProviderIds={"Tvdb": "1"}), sync.CollectionSource.jellyfin, 100, self.POSITIONS
+        ))
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(), sync.CollectionSource.jellyfin, 200, self.POSITIONS
+        ))
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(), sync.CollectionSource.jellyfin, None, self.POSITIONS
+        ))
+
+    def test_skips_multi_episode_files(self):
+        self.assertIsNone(sync._canonical_episode_position(
+            self._item(IndexNumberEnd=22), sync.CollectionSource.jellyfin, 100, self.POSITIONS
+        ))
+
+    def test_translates_plex_direct_episode_guid(self):
+        item = {"Guid": [{"id": "tvdb://4562021"}]}
+        self.assertEqual(sync._canonical_episode_position(
+            item, sync.CollectionSource.plex, 100, self.POSITIONS
+        ), (2, 79))
+
+    def test_rejects_legacy_plex_series_guid_as_episode_identity(self):
+        item = {"Guid": [{"id": "com.plexapp.agents.thetvdb://4562021/2/21"}]}
+        self.assertIsNone(sync._canonical_episode_position(
+            item, sync.CollectionSource.plex, 100, self.POSITIONS
+        ))
+
+
+class LoadPlexEpisodePositionsTests(unittest.IsolatedAsyncioTestCase):
+    class _Scalars:
+        def __init__(self, values):
+            self.values = values
+
+        def all(self):
+            return self.values
+
+    class _Rows:
+        def __init__(self, values):
+            self.values = values
+
+        def scalars(self):
+            return LoadPlexEpisodePositionsTests._Scalars(self.values)
+
+    class _Savepoint:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def test_plex_builds_missing_mapping_without_changing_display_order(self):
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=self._Rows([]))
+        db.begin_nested = MagicMock(return_value=self._Savepoint())
+        item = {
+            "grandparentRatingKey": "plex-show",
+            "Guid": [{"id": "tvdb://4562021"}],
+        }
+        mapped = {(46298, 4562021): (2, 79)}
+
+        with (
+            patch.object(sync, "load_tvdb_episode_id_positions", AsyncMock(side_effect=[{}, mapped])) as load,
+            patch("routers.shows.get_user_tvdb_key", AsyncMock(return_value="tvdb-key")),
+            patch.object(sync, "ensure_episode_order_mapping", AsyncMock(return_value={"matched": 1})) as ensure,
+        ):
+            result = await sync._load_episode_tvdb_positions(
+                db,
+                [item],
+                sync.CollectionSource.plex,
+                {"plex-show": 9},
+                {9: 46298},
+                1,
+                "tmdb-key",
+            )
+
+        self.assertEqual(result, mapped)
+        self.assertEqual(load.await_count, 2)
+        ensure.assert_awaited_once_with(
+            db, 46298, "tmdb-key", "tvdb-key", force=False
+        )
+
+    async def test_plex_episode_with_tmdb_id_needs_no_tvdb_mapping(self):
+        db = MagicMock()
+        item = {
+            "grandparentRatingKey": "plex-show",
+            "Guid": [{"id": "tmdb://908653"}, {"id": "tvdb://4562021"}],
+        }
+        with patch.object(sync, "load_tvdb_episode_id_positions", AsyncMock()) as load:
+            result = await sync._load_episode_tvdb_positions(
+                db,
+                [item],
+                sync.CollectionSource.plex,
+                {"plex-show": 9},
+                {9: 46298},
+                1,
+                "tmdb-key",
+            )
+        self.assertEqual(result, {})
+        load.assert_not_awaited()
+
+
+class FoldDivergentEpisodesTests(unittest.IsolatedAsyncioTestCase):
+    """#447: a divergent twin left by an earlier sync/webhook is settled before
+    the sync loop, so the same episode is not collected or watched twice."""
+
+    async def asyncSetUp(self):
+        import models  # noqa: F401
+        from models.base import Base
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+        )
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.addAsyncCleanup(self.engine.dispose)
+
+    def _item(self, tvdb="4562021"):
+        return {"SeriesId": "jf-show", "ParentIndexNumber": 2, "IndexNumber": 21, "ProviderIds": {"Tvdb": tvdb}}
+
+    async def _seed(self, db, *, canonical, divergent_tvdb=4562021):
+        from models.base import MediaType
+        from models.media import Media
+        from models.show import Show
+        show = Show(tmdb_id=100, title="S")
+        db.add(show)
+        await db.flush()
+        rows = {}
+        if canonical:
+            rows["canonical"] = Media(tmdb_id=2300, media_type=MediaType.episode, title="c", show_id=show.id, season_number=2, episode_number=79)
+        rows["divergent"] = Media(tvdb_id=divergent_tvdb, media_type=MediaType.episode, title="d", show_id=show.id, season_number=2, episode_number=21)
+        db.add_all(rows.values())
+        await db.flush()
+        return show, rows
+
+    def _maps(self, show, rows):
+        by_ep = {(show.id, m.season_number, m.episode_number): m for m in rows.values()}
+        return {"jf-show": show.id}, {show.id: 100}, by_ep
+
+    async def test_moves_the_twin_to_the_canonical_position_when_no_canonical_row_exists(self):
+        async with self.Session() as db:
+            show, rows = await self._seed(db, canonical=False)
+            show_map, tmdb_map, by_ep = self._maps(show, rows)
+            changed, moved = await sync._fold_divergent_episodes(
+                db, [self._item()], sync.CollectionSource.jellyfin,
+                show_map, tmdb_map, {(100, 4562021): (2, 79)}, by_ep,
+            )
+            div = rows["divergent"]
+            self.assertTrue(changed)
+            self.assertEqual(moved, [div])
+            self.assertEqual((div.season_number, div.episode_number), (2, 79))
+            self.assertIs(by_ep[(show.id, 2, 79)], div)
+            self.assertNotIn((show.id, 2, 21), by_ep)
+
+    async def test_does_not_move_a_row_that_is_a_different_episode(self):
+        async with self.Session() as db:
+            show, rows = await self._seed(db, canonical=False, divergent_tvdb=999)
+            show_map, tmdb_map, by_ep = self._maps(show, rows)
+            changed, moved = await sync._fold_divergent_episodes(
+                db, [self._item()], sync.CollectionSource.jellyfin,
+                show_map, tmdb_map, {(100, 4562021): (2, 79)}, by_ep,
+            )
+            self.assertFalse(changed)
+            self.assertEqual(moved, [])
+            self.assertEqual(rows["divergent"].episode_number, 21)
+
+    async def test_merges_the_twin_when_the_canonical_row_exists(self):
+        async with self.Session() as db:
+            show, rows = await self._seed(db, canonical=True)
+            show_map, tmdb_map, by_ep = self._maps(show, rows)
+            with patch.object(sync, "reconcile_divergent_episode_media", AsyncMock(return_value={"merged": 1})) as rec:
+                changed, moved = await sync._fold_divergent_episodes(
+                    db, [self._item()], sync.CollectionSource.jellyfin,
+                    show_map, tmdb_map, {(100, 4562021): (2, 79)}, by_ep,
+                )
+            self.assertTrue(changed)
+            self.assertEqual(moved, [])  # the canonical row is already enriched
+            rec.assert_awaited_once()
+
+    async def test_untranslated_items_are_left_alone(self):
+        async with self.Session() as db:
+            show, rows = await self._seed(db, canonical=False)
+            show_map, tmdb_map, by_ep = self._maps(show, rows)
+            changed, moved = await sync._fold_divergent_episodes(
+                db, [self._item(tvdb="1")], sync.CollectionSource.jellyfin,
+                show_map, tmdb_map, {(100, 4562021): (2, 79)}, by_ep,
+            )
+            self.assertFalse(changed)
 
 
 if __name__ == "__main__":

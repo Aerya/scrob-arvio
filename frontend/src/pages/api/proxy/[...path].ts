@@ -3,6 +3,14 @@ import type { APIRoute } from "astro";
 const BACKEND_PORT = (import.meta.env.BACKEND_PORT as string | undefined) ?? "7331";
 const BACKEND = `http://localhost:${BACKEND_PORT}`;
 
+// This proxy is a generic catch-all for every backend path, so a redirect
+// passed straight through to the browser must be pinned to hosts we actually
+// expect - otherwise a bug (or a future endpoint) returning an unexpected
+// Location would have the browser follow it unchecked. Today the only
+// backend route that redirects here is image serving, straight to TMDB or
+// TheTVDB when the local image cache is disabled or misses.
+const ALLOWED_REDIRECT_HOSTS = new Set(["image.tmdb.org", "artworks.thetvdb.com"]);
+
 async function handle({ params, request }: Parameters<APIRoute>[0]): Promise<Response> {
   const path = params.path ?? "";
   const search = new URL(request.url).search;
@@ -43,11 +51,44 @@ async function handle({ params, request }: Parameters<APIRoute>[0]): Promise<Res
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   const body = hasBody ? await request.arrayBuffer() : undefined;
 
-  const res = await fetch(backendUrl, {
-    method: request.method,
-    headers: forwardHeaders,
-    body,
-  });
+  let res: Response;
+  try {
+    res = await fetch(backendUrl, {
+      method: request.method,
+      headers: forwardHeaders,
+      body,
+      // Some backend routes (e.g. image serving) 3xx-redirect straight to a
+      // third-party host (TMDB) when nothing is locally cached. Following
+      // that here would make this dev-server process itself open the
+      // outbound connection instead of the browser - if that connection
+      // has trouble (flaky network, TLS/SNI issues), it throws an unhandled
+      // error that took down the whole page. Passing the redirect straight
+      // through lets the browser fetch it directly, the same as any other
+      // cross-origin redirect, and fail gracefully (e.g. a broken <img>)
+      // instead of crashing the SSR request.
+      redirect: "manual",
+    });
+  } catch (e) {
+    console.error(`Proxy request to ${backendUrl} failed:`, e);
+    return new Response(null, { status: 502 });
+  }
+
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get("Location");
+    if (location) {
+      let allowed = false;
+      try {
+        allowed = ALLOWED_REDIRECT_HOSTS.has(new URL(location).hostname);
+      } catch {
+        // Relative or otherwise unparseable Location - not one of ours, reject below.
+      }
+      if (!allowed) {
+        console.error(`Proxy refused to forward redirect to unexpected host: ${location}`);
+        return new Response(null, { status: 502 });
+      }
+      return new Response(null, { status: res.status, headers: { Location: location } });
+    }
+  }
 
   const responseHeaders = new Headers();
   const resCt = res.headers.get("Content-Type");
@@ -61,7 +102,7 @@ async function handle({ params, request }: Parameters<APIRoute>[0]): Promise<Res
   }
 
   // Forward streaming, download and caching headers
-  for (const h of ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition", "Cache-Control", "ETag", "Last-Modified"]) {
+  for (const h of ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition", "Cache-Control", "ETag", "Last-Modified", "X-Accel-Buffering"]) {
     const v = res.headers.get(h);
     if (v) responseHeaders.set(h, v);
   }

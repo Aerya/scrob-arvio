@@ -1,11 +1,15 @@
+import json
 import os
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
-from routers.history import _compute_next_episode, _group_last_watched, _has_aired, _has_confirmed_air_date
+from routers.history import _refresh_next_episode_air_dates, _attach_show_last_watched, _compute_next_episode, _group_last_watched, _has_aired, _has_confirmed_air_date, _next_up_needs_live_fetch, _progress_percentages, _remaining_episode_stats, _stream_next_up_refresh, _next_episode_candidates_stmt, _last_watched_per_show_stmt
+from core.rewatch import capped_season_episode_counts
 
 
 class ComputeNextEpisodeTests(unittest.TestCase):
@@ -39,6 +43,73 @@ class ComputeNextEpisodeTests(unittest.TestCase):
     def test_specials_season_zero_is_never_returned_and_never_used_as_current(self):
         seasons = [{"season_number": 0, "episode_count": 5}, {"season_number": 1, "episode_count": 12}]
         self.assertEqual(_compute_next_episode(seasons, 0, 3), (1, 1))
+
+
+class LastWatchedPerShowStmtTests(unittest.TestCase):
+    """Next Up's position per show is picked in SQL; by_recent only changes the
+    ordering DISTINCT ON uses to pick the row."""
+
+    @staticmethod
+    def order_by(by_recent):
+        from sqlalchemy.dialects import postgresql
+
+        sql = str(_last_watched_per_show_stmt([], by_recent).compile(dialect=postgresql.dialect()))
+        return " ".join(sql.split("ORDER BY", 1)[1].split())
+
+    def test_default_is_the_furthest_watched_episode(self):
+        self.assertEqual(
+            self.order_by(False),
+            "media.show_id, media.season_number DESC, media.episode_number DESC",
+        )
+
+    def test_by_recent_orders_by_latest_watch_first_and_then_by_furthest(self):
+        # NULL watched_at sorts last, so an untimestamped row never beats a dated
+        # one, and a show with no dates falls back to its furthest episode.
+        self.assertEqual(
+            self.order_by(True),
+            "media.show_id, watch_events.watched_at DESC NULLS LAST, "
+            "media.season_number DESC, media.episode_number DESC",
+        )
+
+    def test_both_modes_keep_one_row_per_show_and_skip_unknown_positions(self):
+        from sqlalchemy.dialects import postgresql
+
+        for by_recent in (False, True):
+            sql = str(_last_watched_per_show_stmt([], by_recent).compile(dialect=postgresql.dialect()))
+            self.assertIn("DISTINCT ON (media.show_id)", sql)
+            self.assertIn("media.season_number IS NOT NULL", sql)
+            self.assertIn("media.episode_number IS NOT NULL", sql)
+
+
+class NextEpisodeCandidatesStmtTests(unittest.TestCase):
+    """The next-episode lookup is one statement of a fixed shape, however many shows
+    the user watches (it used to grow an OR branch and four bind parameters per show)."""
+
+    @staticmethod
+    def compiled(show_count):
+        from sqlalchemy.dialects import postgresql
+
+        stmt = _next_episode_candidates_stmt({i: (1, i) for i in range(1, show_count + 1)})
+        compiled = stmt.compile(dialect=postgresql.dialect())
+        return str(compiled), compiled.params
+
+    def test_the_sql_and_the_parameter_count_do_not_depend_on_the_number_of_shows(self):
+        small_sql, small_params = self.compiled(3)
+        large_sql, large_params = self.compiled(300)
+        self.assertEqual(small_sql, large_sql)
+        self.assertEqual(len(small_params), len(large_params))
+
+    def test_positions_travel_as_arrays_and_one_row_per_show_comes_back(self):
+        sql, params = self.compiled(3)
+        self.assertIn("unnest(", sql.lower())
+        self.assertIn("DISTINCT ON (media.show_id)", sql)
+        self.assertEqual(params["pos_show"], [1, 2, 3])
+        self.assertEqual(params["pos_season"], [1, 1, 1])
+        self.assertEqual(params["pos_episode"], [1, 2, 3])
+
+    def test_the_next_episode_is_strictly_after_the_last_watched_one(self):
+        sql, _ = self.compiled(1)
+        self.assertIn("(media.season_number, media.episode_number) > (pos.season, pos.episode)", sql)
 
 
 class GroupLastWatchedTests(unittest.TestCase):
@@ -84,6 +155,78 @@ class GroupLastWatchedTests(unittest.TestCase):
         rows = [(1, None, 1, None), (1, None, 2, None)]
         last_per_show, last_watched_at = _group_last_watched(rows)
         self.assertNotIn(1, last_per_show)
+
+    def test_by_recent_picks_most_recently_watched_episode_not_furthest(self):
+        # Arrange
+        older = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        newer = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [(1, 8, 14, older), (1, 1, 3, newer)]
+
+        # Act
+        last_per_show, last_watched_at = _group_last_watched(rows, by_recent=True)
+
+        # Assert
+        self.assertEqual(last_per_show[1], (1, 3))
+        self.assertEqual(last_watched_at[1], newer)
+
+    def test_by_recent_tie_keeps_furthest_episode(self):
+        # Arrange
+        same = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [(1, 1, 5, same), (1, 1, 4, same)]
+
+        # Act
+        last_per_show, _ = _group_last_watched(rows, by_recent=True)
+
+        # Assert
+        self.assertEqual(last_per_show[1], (1, 5))
+
+    def test_by_recent_timestamped_row_beats_null_row_seen_first(self):
+        # Arrange
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [(1, 8, 14, None), (1, 1, 3, stamp)]
+
+        # Act
+        last_per_show, _ = _group_last_watched(rows, by_recent=True)
+
+        # Assert
+        self.assertEqual(last_per_show[1], (1, 3))
+
+    def test_by_recent_with_only_null_watched_at_falls_back_to_furthest(self):
+        # Arrange
+        rows = [(1, 1, 2, None), (1, 1, 1, None)]
+
+        # Act
+        last_per_show, _ = _group_last_watched(rows, by_recent=True)
+
+        # Assert
+        self.assertEqual(last_per_show[1], (1, 2))
+
+    def test_by_recent_tracks_each_show_independently(self):
+        # Arrange
+        older = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        newer = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [(1, 2, 2, older), (1, 1, 1, newer), (2, 3, 3, newer), (2, 1, 1, older)]
+
+        # Act
+        last_per_show, _ = _group_last_watched(rows, by_recent=True)
+
+        # Assert
+        self.assertEqual(last_per_show, {1: (1, 1), 2: (3, 3)})
+
+
+class AttachShowLastWatchedTests(unittest.TestCase):
+    """#521: enrich_with_state stamps episodes with their own (null, for an
+    unwatched next-up episode) last_watched_at, so this must run after it."""
+
+    def test_sets_show_level_timestamp_over_enriched_null(self):
+        items = [{"show_id": 1, "last_watched_at": None}]
+        _attach_show_last_watched(items, {1: datetime(2026, 10, 1, 12, 0, 0)})
+        self.assertEqual(items[0]["last_watched_at"], "2026-10-01T12:00:00")
+
+    def test_show_without_timestamp_gets_none(self):
+        items = [{"show_id": 2}]
+        _attach_show_last_watched(items, {1: datetime(2026, 10, 1)})
+        self.assertIsNone(items[0]["last_watched_at"])
 
 
 class HasAiredTests(unittest.TestCase):
@@ -131,3 +274,492 @@ class HasConfirmedAirDateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemainingEpisodeStatsTests(unittest.TestCase):
+    """Feature #170: episodes-left / remaining-runtime estimate on Next Up."""
+
+    def test_basic_remaining_count_and_runtime(self):
+        stats = _remaining_episode_stats(
+            {1: 12, 2: 10}, {1: 12, 2: 4}, avg_runtime=30.0
+        )
+        self.assertEqual(stats["episodes_left"], 6)
+        self.assertEqual(stats["remaining_runtime"], 180)
+
+    def test_specials_are_excluded(self):
+        stats = _remaining_episode_stats(
+            {0: 5, 1: 10}, {0: 5, 1: 3}, avg_runtime=None
+        )
+        self.assertEqual(stats["episodes_left"], 7)
+        self.assertIsNone(stats["remaining_runtime"])
+
+    def test_watched_capped_per_season(self):
+        # Provider numbering mismatch: more local watched rows than TMDB says
+        # the season has must not push the remainder of other seasons down.
+        stats = _remaining_episode_stats(
+            {1: 8, 2: 8}, {1: 12, 2: 0}, avg_runtime=45.0
+        )
+        self.assertEqual(stats["episodes_left"], 8)
+
+    def test_clamped_to_one_when_metadata_is_stale(self):
+        # The caller only asks about shows with an aired unwatched episode, so
+        # stale TMDB counts saying "all watched" still yield 1, never 0.
+        stats = _remaining_episode_stats({1: 10}, {1: 10}, avg_runtime=40.0)
+        self.assertEqual(stats["episodes_left"], 1)
+        self.assertEqual(stats["remaining_runtime"], 40)
+
+    def test_no_aired_episodes_returns_none(self):
+        self.assertIsNone(_remaining_episode_stats({}, {}, avg_runtime=30.0))
+        self.assertIsNone(_remaining_episode_stats({0: 3}, {}, avg_runtime=30.0))
+
+
+class ProgressPercentagesTests(unittest.TestCase):
+    """#374: per-show watched/collected counts and percentages for the
+    Progress dashboard."""
+
+    def test_basic_counts_and_percentages(self):
+        stats = _progress_percentages({1: 10, 2: 10}, {1: 10, 2: 5}, {1: 10, 2: 10})
+        self.assertEqual(stats["episodes_total"], 20)
+        self.assertEqual(stats["episodes_watched"], 15)
+        self.assertEqual(stats["episodes_collected"], 20)
+        self.assertEqual(stats["watch_pct"], 75)
+        self.assertEqual(stats["collection_pct"], 100)
+
+    def test_specials_excluded_from_every_count(self):
+        stats = _progress_percentages({0: 4, 1: 8}, {0: 4, 1: 4}, {0: 4, 1: 8})
+        self.assertEqual(stats["episodes_total"], 8)
+        self.assertEqual(stats["episodes_watched"], 4)
+        self.assertEqual(stats["episodes_collected"], 8)
+
+    def test_counts_capped_per_season_so_pct_never_exceeds_100(self):
+        # Provider numbering mismatch: 14 local watched rows in a 10-episode
+        # season must still read 100%, not 140%.
+        stats = _progress_percentages({1: 10}, {1: 14}, {1: 12})
+        self.assertEqual(stats["episodes_watched"], 10)
+        self.assertEqual(stats["episodes_collected"], 10)
+        self.assertEqual(stats["watch_pct"], 100)
+        self.assertEqual(stats["collection_pct"], 100)
+
+    def test_no_season_metadata_returns_none(self):
+        self.assertIsNone(_progress_percentages({}, {1: 3}, {1: 3}))
+        self.assertIsNone(_progress_percentages({0: 5}, {0: 5}, {0: 5}))
+
+    def test_progress_only_in_specials_or_unknown_seasons_counts_as_zero(self):
+        # A show can reach the endpoint's "started" gate on a Special or an
+        # episode in a season the cached metadata doesn't list; neither counts
+        # here, so the row reads 0 - which is why the endpoint then drops it.
+        stats = _progress_percentages({1: 8, 2: 8}, {0: 3, 9: 2}, {0: 3, 9: 2})
+        self.assertEqual(stats["episodes_total"], 16)
+        self.assertEqual(stats["episodes_watched"], 0)
+        self.assertEqual(stats["episodes_collected"], 0)
+
+    def test_rounds_to_nearest_whole_percent(self):
+        stats = _progress_percentages({1: 3}, {1: 1}, {1: 2})
+        self.assertEqual(stats["watch_pct"], 33)
+        self.assertEqual(stats["collection_pct"], 67)
+
+
+class CappedSeasonCountsFromCacheTests(unittest.TestCase):
+    """#296: unaired episodes must not be counted on the Next Up card."""
+
+    class _Show:
+        def __init__(self, tmdb_data):
+            self.tmdb_data = tmdb_data
+
+    def _show(self, last_ep):
+        data = {"seasons": [{"season_number": 1, "episode_count": 10},
+                            {"season_number": 2, "episode_count": 10}]}
+        if last_ep is not None:
+            data["last_episode_to_air"] = last_ep
+        return self._Show(data)
+
+    def test_current_season_capped_at_last_aired_episode(self):
+        # Season 2 is mid-flight: 8 of 10 episodes out.
+        counts = capped_season_episode_counts(
+            self._show({"season_number": 2, "episode_number": 8})
+        )
+        self.assertEqual(counts[2], 8)
+        # 7 watched of the 8 aired -> exactly 1 left, not 3.
+        stats = _remaining_episode_stats(counts, {1: 10, 2: 7}, avg_runtime=51.0)
+        self.assertEqual(stats["episodes_left"], 1)
+
+    def test_future_seasons_are_zeroed(self):
+        counts = capped_season_episode_counts(
+            self._show({"season_number": 1, "episode_number": 4})
+        )
+        self.assertEqual(counts[1], 4)
+        self.assertEqual(counts[2], 0)
+
+    def test_fractional_average_runtime_rounds(self):
+        stats = _remaining_episode_stats({1: 4}, {1: 1}, avg_runtime=42.5)
+        self.assertEqual(stats["episodes_left"], 3)
+        self.assertEqual(stats["remaining_runtime"], 128)
+
+class NeedsLiveFetchTests(unittest.TestCase):
+    """Regression tests for #332 (follow-up to #294/#307): the missing-episode
+    fallback used to live-fetch every fully-watched show from TMDB on every
+    cold load - minutes on a big library. _next_up_needs_live_fetch is the
+    gate that decides, from the Show row alone, whether the stored tmdb_data
+    snapshot can answer "did a new episode appear?" or TMDB must be asked."""
+
+    TODAY = date(2026, 3, 15)
+    NOW = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+
+    class _Show:
+        def __init__(self, status="Returning Series", tmdb_id=42, tmdb_data=None):
+            self.status = status
+            self.tmdb_id = tmdb_id
+            self.tmdb_data = tmdb_data
+
+    def _needs(self, show):
+        return _next_up_needs_live_fetch(show, self.TODAY, self.NOW)
+
+    def _fresh(self):
+        return (self.NOW - timedelta(hours=1)).isoformat()
+
+    def _stale(self):
+        return (self.NOW - timedelta(days=3)).isoformat()
+
+    # --- the #332 case: finished shows must not cost a TMDB call ---
+
+    def test_finished_show_with_snapshot_is_not_fetched(self):
+        show = self._Show(status="Ended", tmdb_data={"seasons": [{"season_number": 1, "episode_count": 10}]})
+        self.assertFalse(self._needs(show))
+
+    def test_canceled_show_with_snapshot_is_not_fetched(self):
+        show = self._Show(status="Canceled", tmdb_data={"seasons": []})
+        self.assertFalse(self._needs(show))
+
+    def test_finished_show_without_seasons_key_is_fetched_once_to_build_snapshot(self):
+        # Status set by some path that never stored a snapshot: fetching once
+        # writes a "seasons" key (possibly empty), after which this stops.
+        show = self._Show(status="Ended", tmdb_data={})
+        self.assertTrue(self._needs(show))
+        show_no_data = self._Show(status="Ended", tmdb_data=None)
+        self.assertTrue(self._needs(show_no_data))
+
+    def test_revived_show_is_fetched_again(self):
+        # The Futurama case (#307): the daily sweep flips status away from
+        # Ended - the gate must then treat the show as live again. The sweep
+        # also rewrites refreshed_at, but a revival mid-window must not wait
+        # out the staleness threshold if the snapshot is old.
+        show = self._Show(status="Returning Series", tmdb_data={"seasons": [], "refreshed_at": self._stale()})
+        self.assertTrue(self._needs(show))
+
+    # --- returning shows: fetch only when something new can exist ---
+
+    def test_future_next_air_date_with_fresh_snapshot_is_not_fetched(self):
+        show = self._Show(tmdb_data={
+            "seasons": [],
+            "next_episode_to_air": {"air_date": "2026-04-01"},
+            "refreshed_at": self._fresh(),
+        })
+        self.assertFalse(self._needs(show))
+
+    def test_next_air_date_today_is_fetched(self):
+        show = self._Show(tmdb_data={
+            "seasons": [],
+            "next_episode_to_air": {"air_date": "2026-03-15"},
+            "refreshed_at": self._fresh(),
+        })
+        self.assertTrue(self._needs(show))
+
+    def test_past_next_air_date_is_fetched(self):
+        show = self._Show(tmdb_data={
+            "seasons": [],
+            "next_episode_to_air": {"air_date": "2026-03-01"},
+            "refreshed_at": self._fresh(),
+        })
+        self.assertTrue(self._needs(show))
+
+    def test_no_scheduled_episode_with_fresh_snapshot_is_not_fetched(self):
+        show = self._Show(tmdb_data={"seasons": [], "refreshed_at": self._fresh()})
+        self.assertFalse(self._needs(show))
+
+    def test_stale_snapshot_is_fetched_even_with_future_air_date(self):
+        # #287's lesson: never trust a snapshot indefinitely. Even a stored
+        # future air date might have been moved up since the snapshot was
+        # written, so staleness alone forces a re-fetch.
+        show = self._Show(tmdb_data={
+            "seasons": [],
+            "next_episode_to_air": {"air_date": "2026-04-01"},
+            "refreshed_at": self._stale(),
+        })
+        self.assertTrue(self._needs(show))
+
+    def test_snapshot_without_refreshed_at_is_fetched(self):
+        # Pre-upgrade rows have no refreshed_at: they keep today's
+        # always-fetch behavior until something writes the stamp.
+        show = self._Show(tmdb_data={"seasons": []})
+        self.assertTrue(self._needs(show))
+        self.assertTrue(self._needs(self._Show(tmdb_data=None)))
+
+    def test_malformed_refreshed_at_is_fetched(self):
+        show = self._Show(tmdb_data={"seasons": [], "refreshed_at": "not-a-date"})
+        self.assertTrue(self._needs(show))
+
+    def test_naive_refreshed_at_is_treated_as_utc_not_crashed_on(self):
+        naive_fresh = (self.NOW - timedelta(hours=1)).replace(tzinfo=None).isoformat()
+        show = self._Show(tmdb_data={"seasons": [], "refreshed_at": naive_fresh})
+        self.assertFalse(self._needs(show))
+
+    # --- shows this path must never touch ---
+
+    def test_show_without_tmdb_id_is_never_fetched(self):
+        self.assertFalse(self._needs(self._Show(tmdb_id=None, tmdb_data=None)))
+        self.assertFalse(self._needs(None))
+
+    def test_tvdb_sourced_snapshot_is_never_fetched(self):
+        # A TVDB-sourced snapshot's season layout is TVDB-shaped (#335);
+        # fetching would later overwrite it with TMDB-shaped data. Applies no
+        # matter how stale it is or what status it carries.
+        show = self._Show(tmdb_data={"seasons": [], "source": "tvdb", "refreshed_at": self._stale()})
+        self.assertFalse(self._needs(show))
+
+
+class ApplyShowMetadataSnapshotTests(unittest.TestCase):
+    """The Next Up gate above only works if apply_show_metadata actually
+    writes the fields it reads - these pin that contract (#332)."""
+
+    class _Show:
+        def __init__(self):
+            self.title = "Old"
+            self.status = None
+            self.tmdb_data = None
+
+    def test_snapshot_carries_gating_fields(self):
+        from routers.shows import apply_show_metadata
+
+        show = self._Show()
+        next_ep = {"air_date": "2026-04-01", "season_number": 2, "episode_number": 1}
+        apply_show_metadata(show, {"name": "New", "status": "Returning Series",
+                                   "next_episode_to_air": next_ep, "seasons": []})
+        self.assertEqual(show.tmdb_data["next_episode_to_air"], next_ep)
+        refreshed = datetime.fromisoformat(show.tmdb_data["refreshed_at"])
+        self.assertIsNotNone(refreshed.tzinfo)
+        self.assertLess((datetime.now(timezone.utc) - refreshed).total_seconds(), 60)
+
+    def test_snapshot_always_has_seasons_key(self):
+        # The finals branch of _next_up_needs_live_fetch uses "seasons" being
+        # absent as "never snapshotted, fetch once" - so a rebuild for a show
+        # TMDB reports no seasons for must still write the key, or that show
+        # would be re-fetched on every load forever.
+        from routers.shows import apply_show_metadata
+
+        show = self._Show()
+        apply_show_metadata(show, {"name": "New", "status": "Ended"})
+        self.assertIn("seasons", show.tmdb_data)
+        self.assertIn("next_episode_to_air", show.tmdb_data)
+
+
+class _FakeScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _FakeSession:
+    """Minimal async session stand-in for _stream_next_up_refresh: one execute()
+    returning the show rows, plus commit() call counting."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.commits = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, *a, **k):
+        return _FakeScalarResult(self._rows)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def _show(tmdb_id=1, tmdb_data=None):
+    return SimpleNamespace(id=tmdb_id, tmdb_id=tmdb_id, status="Returning Series", tmdb_data=tmdb_data)
+
+
+async def _collect(user_id, api_key):
+    return [json.loads(line) async for line in _stream_next_up_refresh(user_id, api_key)]
+
+
+class StreamNextUpRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """The "Refresh from TMDB" button streams NDJSON progress while re-checking
+    TMDB for every show the user watches, then rewrites each stored snapshot."""
+
+    def _patches(self, rows, get_show):
+        session = _FakeSession(rows)
+        apply_meta = AsyncMock()  # patched as a plain callable below
+        apply_calls = []
+        return session, apply_calls, (
+            patch("routers.history.check_tmdb_key", lambda k: bool(k)),
+            patch("routers.history.AsyncSessionLocal", lambda: session),
+            patch("routers.history.tmdb.get_show", get_show),
+            patch("routers.shows.apply_show_metadata", lambda show, data: apply_calls.append(show.tmdb_id)),
+        )
+
+    async def test_no_tmdb_key_emits_single_terminal_line(self):
+        session, _, patches = self._patches([], AsyncMock())
+        with patches[0], patches[1], patches[2], patches[3]:
+            msgs = await _collect(1, None)
+        self.assertEqual(msgs, [{"total": 0, "complete": True, "error": "no_tmdb_key"}])
+
+    async def test_no_watched_shows_completes_immediately(self):
+        session, _, patches = self._patches([], AsyncMock())
+        with patches[0], patches[1], patches[2], patches[3]:
+            msgs = await _collect(1, "key")
+        self.assertEqual(msgs, [{"total": 0}, {"done": 0, "total": 0, "complete": True}])
+
+    async def test_progress_lines_and_snapshot_writes(self):
+        rows = [_show(1, {}), _show(2, {}), _show(3, {})]
+        get_show = AsyncMock(side_effect=lambda tmdb_id, **k: {"id": tmdb_id, "name": f"S{tmdb_id}"})
+        session, apply_calls, patches = self._patches(rows, get_show)
+        with patches[0], patches[1], patches[2], patches[3]:
+            msgs = await _collect(1, "key")
+
+        self.assertEqual(msgs[0], {"total": 3})
+        self.assertEqual([m["done"] for m in msgs[1:4]], [1, 2, 3])
+        self.assertEqual(msgs[-1], {"done": 3, "total": 3, "complete": True})
+        self.assertEqual(sorted(apply_calls), [1, 2, 3])
+        self.assertGreaterEqual(session.commits, 1)  # final commit
+
+    async def test_tvdb_sourced_show_is_skipped(self):
+        rows = [_show(1, {"source": "tvdb"}), _show(2, {})]
+        get_show = AsyncMock(side_effect=lambda tmdb_id, **k: {"id": tmdb_id})
+        session, apply_calls, patches = self._patches(rows, get_show)
+        with patches[0], patches[1], patches[2], patches[3]:
+            msgs = await _collect(1, "key")
+        self.assertEqual(msgs[0], {"total": 1})
+        self.assertEqual(apply_calls, [2])
+
+    async def test_one_show_failing_still_completes_progress(self):
+        rows = [_show(1, {}), _show(2, {})]
+
+        async def flaky(tmdb_id, **k):
+            if tmdb_id == 1:
+                raise RuntimeError("TMDB 500")
+            return {"id": tmdb_id}
+
+        session, apply_calls, patches = self._patches(rows, AsyncMock(side_effect=flaky))
+        with patches[0], patches[1], patches[2], patches[3]:
+            msgs = await _collect(1, "key")
+        self.assertEqual(msgs[0], {"total": 2})
+        self.assertEqual(msgs[-1], {"done": 2, "total": 2, "complete": True})
+        self.assertEqual(apply_calls, [2])  # only the one that succeeded
+
+
+class FetchMissingEpisodeTranslationsTests(unittest.IsolatedAsyncioTestCase):
+    """#450: Next Up cards for episodes with no stored translation must be
+    translated from TMDB instead of staying in the first-enriched language."""
+
+    def _ep(self, media_id, tmdb_show_id=10):
+        show = SimpleNamespace(tmdb_id=tmdb_show_id, tvdb_id=None, canonical_source="tmdb")
+        return SimpleNamespace(id=media_id, show=show, season_number=2, episode_number=3, title="Along Came a Spider")
+
+    async def test_fetches_stores_and_returns_translation(self):
+        from routers.history import _fetch_missing_episode_translations
+        db = AsyncMock()
+        tmdb_ep = {"name": "Die Spinne", "overview": "Ein Text", "still_path": "/s.jpg"}
+        with (
+            patch("routers.history.check_tmdb_key", return_value=True),
+            patch("routers.history.tmdb.get_episode", AsyncMock(return_value=tmdb_ep)) as get_ep,
+            patch("routers.history.upsert_media_translation", AsyncMock()) as upsert,
+        ):
+            out = await _fetch_missing_episode_translations(db, [self._ep(7)], "de", "key")
+        get_ep.assert_awaited_once_with(10, 2, 3, api_key="key", language="de")
+        upsert.assert_awaited_once()
+        self.assertEqual(out[7]["title"], "Die Spinne")
+
+    async def test_tmdb_failure_leaves_episode_untranslated(self):
+        from routers.history import _fetch_missing_episode_translations
+        with (
+            patch("routers.history.check_tmdb_key", return_value=True),
+            patch("routers.history.tmdb.get_episode", AsyncMock(side_effect=RuntimeError("boom"))),
+            patch("routers.history.upsert_media_translation", AsyncMock()) as upsert,
+        ):
+            out = await _fetch_missing_episode_translations(AsyncMock(), [self._ep(7)], "de", "key")
+        self.assertEqual(out, {})
+        upsert.assert_not_awaited()
+
+
+class RefreshNextEpisodeAirDatesTests(unittest.IsolatedAsyncioTestCase):
+    """#365: a next episode stored before TMDB had an air date stays undated,
+    so Next Up hides it for good even after it airs and the calendar lists it.
+    #424: the reverse - a stored date TMDB later moved into the future."""
+
+    TODAY = date(2026, 9, 22)
+
+    def _episode(self, release_date=None, tvdb_canonical=False):
+        show = SimpleNamespace(
+            tmdb_id=1, tvdb_id=2, canonical_source="tvdb" if tvdb_canonical else "tmdb", tmdb_data={},
+        )
+        return SimpleNamespace(
+            id=10, show=show, season_number=22, episode_number=1, release_date=release_date,
+            tmdb_id=None, title="", overview=None, poster_path=None,
+        )
+
+    async def _run(self, episode, tmdb_result):
+        db = SimpleNamespace(commit=AsyncMock())
+        get_episode_mock = AsyncMock(side_effect=tmdb_result) if isinstance(tmdb_result, Exception) else AsyncMock(return_value=tmdb_result)
+        with patch("routers.history.get_user_tmdb_key", AsyncMock(return_value="k" * 32)), \
+                patch("routers.history.check_tmdb_key", return_value=True), \
+                patch("routers.history.tmdb.get_episode", get_episode_mock) as get_episode:
+            await _refresh_next_episode_air_dates(db, 1, [episode], self.TODAY)
+        return db, get_episode
+
+    async def test_undated_episode_gets_its_air_date_once_tmdb_has_one(self):
+        ep = self._episode()
+        db, _ = await self._run(ep, {"id": 99, "air_date": "2026-09-20", "name": "Pilot", "overview": "o"})
+        self.assertEqual(ep.release_date, "2026-09-20")
+        self.assertEqual(ep.tmdb_id, 99)
+        self.assertEqual(ep.title, "Pilot")
+        db.commit.assert_awaited_once()
+
+    async def test_still_undated_on_tmdb_stays_hidden_and_writes_nothing(self):
+        ep = self._episode()
+        db, _ = await self._run(ep, {"id": 99, "air_date": None})
+        self.assertIsNone(ep.release_date)
+        db.commit.assert_not_awaited()
+
+    async def test_recently_dated_episode_moved_later_on_tmdb_is_updated(self):
+        # #424: stored as aired on Sept 20, TMDB now says Oct 16.
+        ep = self._episode(release_date="2026-09-20")
+        db, _ = await self._run(ep, {"id": 99, "air_date": "2026-10-16"})
+        self.assertEqual(ep.release_date, "2026-10-16")
+        db.commit.assert_awaited_once()
+
+    async def test_unchanged_date_writes_nothing(self):
+        ep = self._episode(release_date="2026-09-20")
+        db, _ = await self._run(ep, {"id": 99, "air_date": "2026-09-20"})
+        db.commit.assert_not_awaited()
+
+    async def test_long_aired_episode_is_not_fetched(self):
+        ep = self._episode(release_date="2026-06-01")
+        _, get_episode = await self._run(ep, {"air_date": "2026-10-16"})
+        get_episode.assert_not_awaited()
+        self.assertEqual(ep.release_date, "2026-06-01")
+
+    async def test_future_dated_episode_is_not_fetched(self):
+        ep = self._episode(release_date="2026-11-30")
+        _, get_episode = await self._run(ep, {"air_date": "2026-01-01"})
+        get_episode.assert_not_awaited()
+
+    async def test_tvdb_canonical_show_is_not_fetched_from_tmdb(self):
+        ep = self._episode(tvdb_canonical=True)
+        _, get_episode = await self._run(ep, {"air_date": "2026-01-01"})
+        get_episode.assert_not_awaited()
+
+    async def test_tmdb_failure_is_not_fatal(self):
+        ep = self._episode(release_date="2026-09-20")
+        db, _ = await self._run(ep, RuntimeError("boom"))
+        self.assertEqual(ep.release_date, "2026-09-20")
+        db.commit.assert_not_awaited()

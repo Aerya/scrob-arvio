@@ -235,6 +235,21 @@ async def get_ratings(client_id: str, access_token: str) -> dict:
     return {"movies": movies, "shows": shows, "seasons": seasons, "episodes": episodes}
 
 
+async def get_collection(client_id: str, access_token: str) -> dict:
+    """Fetch the user's Trakt collection (movies + shows with nested seasons/
+    episodes). Used to dedup the outbound collection push so a steady-state run
+    re-sends nothing (#327)."""
+    async def _fetch(path: str) -> list[dict]:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            return await _get_all_pages(client, path, _headers(client_id, access_token))
+
+    movies, shows = await asyncio.gather(
+        _fetch("/sync/collection/movies"),
+        _fetch("/sync/collection/shows"),
+    )
+    return {"movies": movies, "shows": shows}
+
+
 # ── Outbound Push ─────────────────────────────────────────────────────────────
 
 async def add_to_history_batch(
@@ -554,12 +569,14 @@ async def get_list_items(client_id: str, access_token: str, list_slug: str) -> l
     Returns list of: {type, movie: {title, ids: {tmdb}}, show: {title, ids: {tmdb}}}
     """
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(
-            f"{TRAKT_BASE}/users/me/lists/{list_slug}/items",
-            headers=_headers(client_id, access_token),
+        # Trakt marks this endpoint "pagination optional", but large lists come
+        # back capped at one page (~100 items) unless page/limit are requested
+        # explicitly - a single unpaginated GET silently truncates (see #193).
+        return await _get_all_pages(
+            client,
+            f"/users/me/lists/{list_slug}/items",
+            _headers(client_id, access_token),
         )
-        resp.raise_for_status()
-        return resp.json()
 
 
 async def get_watchlist(client_id: str, access_token: str) -> list[dict]:
@@ -569,12 +586,13 @@ async def get_watchlist(client_id: str, access_token: str) -> list[dict]:
     """
     async def _fetch(kind: str) -> list:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(
-                f"{TRAKT_BASE}/sync/watchlist/{kind}",
-                headers=_headers(client_id, access_token),
+            # See the matching comment in get_list_items (#193) - same silent
+            # truncation risk for a watchlist over ~100 items.
+            return await _get_all_pages(
+                client,
+                f"/sync/watchlist/{kind}",
+                _headers(client_id, access_token),
             )
-            resp.raise_for_status()
-            return resp.json()
 
     movies, shows = await asyncio.gather(_fetch("movies"), _fetch("shows"))
     return movies + shows
@@ -600,6 +618,19 @@ async def remove_from_watchlist(client_id: str, access_token: str, media_type: s
             headers=_headers(client_id, access_token),
         )
         resp.raise_for_status()
+
+
+async def update_watchlist(
+    client_id: str, access_token: str, items: dict[str, list[dict]], *, remove: bool = False,
+) -> dict:
+    """Add (or remove) many movies/shows in one call - items is
+    {"movies": [{"ids": {"tmdb": 1}}], "shows": [...]}. Returns Trakt's
+    response, whose "not_found" lists the items it couldn't match."""
+    path = "/sync/watchlist/remove" if remove else "/sync/watchlist"
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(f"{TRAKT_BASE}{path}", json=items, headers=_headers(client_id, access_token))
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
 
 
 async def add_to_list(client_id: str, access_token: str, list_slug: str, media_type: str, tmdb_id: int) -> None:
@@ -708,6 +739,46 @@ async def remove_show_rating(client_id: str, access_token: str, tmdb_id: int) ->
         resp.raise_for_status()
 
 
+async def get_dropped_shows(client_id: str, access_token: str) -> list[dict]:
+    """Fetch the user's dropped shows via the hidden-items API.
+
+    Returns list of: {hidden_at, type: "show", show: {title, ids: {tmdb}}}
+    """
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        return await _get_all_pages(client, "/users/hidden/dropped", _headers(client_id, access_token))
+
+
+async def add_to_hidden(client_id: str, access_token: str, section: str, tmdb_id: int) -> None:
+    """Hide a show for a section of the hidden-items API ('dropped' is
+    shows-only - the same mechanism behind Trakt's own "Drop Show" button)."""
+    await add_to_hidden_batch(client_id, access_token, section, [tmdb_id])
+
+
+async def add_to_hidden_batch(client_id: str, access_token: str, section: str, tmdb_ids: list[int]) -> None:
+    """add_to_hidden for multiple shows in one request (used by the scheduled
+    push to reconcile dropped state - see #329)."""
+    if not tmdb_ids:
+        return
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            f"{TRAKT_BASE}/users/hidden/{section}",
+            json={"shows": [{"ids": {"tmdb": tmdb_id}} for tmdb_id in tmdb_ids]},
+            headers=_headers(client_id, access_token),
+        )
+        resp.raise_for_status()
+
+
+async def remove_from_hidden(client_id: str, access_token: str, section: str, tmdb_id: int) -> None:
+    """Unhide a show from a section of the hidden-items API."""
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            f"{TRAKT_BASE}/users/hidden/{section}/remove",
+            json={"shows": [{"ids": {"tmdb": tmdb_id}}]},
+            headers=_headers(client_id, access_token),
+        )
+        resp.raise_for_status()
+
+
 async def scrobble_movie(
     client_id: str,
     access_token: str,
@@ -772,3 +843,65 @@ async def scrobble_episode(
             headers=_headers(client_id, access_token),
         )
         resp.raise_for_status()
+
+
+# ── Public comments (Trakt's own community comments, not the user's) ──────────
+
+_COMMENT_SORTS = {"newest", "oldest", "likes", "replies", "highest", "lowest", "plays"}
+
+
+async def resolve_trakt_id(client_id: str, id_type: str, id_value, media_type: str) -> Optional[str]:
+    """Resolve an external id (tmdb or tvdb) to a Trakt slug for media_type
+    ('movie' or 'show'). Returns None if Trakt has no match.
+
+    The comments endpoints below take a Trakt-slug, Trakt-id, or IMDB-id in
+    their :id path segment - never a raw TMDB/TVDB id - so this is required
+    before any comments call for an item Scrob only knows by tmdb_id/tvdb_id.
+    """
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.get(
+            f"{TRAKT_BASE}/search/{id_type}/{id_value}",
+            params={"type": media_type},
+            headers=_headers(client_id),
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    for result in results:
+        item = result.get(media_type)
+        if item:
+            slug = item.get("ids", {}).get("slug")
+            if slug:
+                return slug
+    return None
+
+
+async def _get_comments(client_id: str, path: str, sort: str, page: int, limit: int) -> list[dict]:
+    sort = sort if sort in _COMMENT_SORTS else "likes"
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.get(
+            f"{TRAKT_BASE}{path}/comments/{sort}",
+            params={"page": page, "limit": limit},
+            headers=_headers(client_id),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def get_movie_comments(client_id: str, movie_id: str, sort: str = "likes", page: int = 1, limit: int = 10) -> list[dict]:
+    """movie_id is a Trakt slug/id or IMDB id - see resolve_trakt_id."""
+    return await _get_comments(client_id, f"/movies/{movie_id}", sort, page, limit)
+
+
+async def get_show_comments(client_id: str, show_id: str, sort: str = "likes", page: int = 1, limit: int = 10) -> list[dict]:
+    """show_id is a Trakt slug/id or IMDB id - see resolve_trakt_id."""
+    return await _get_comments(client_id, f"/shows/{show_id}", sort, page, limit)
+
+
+async def get_season_comments(client_id: str, show_id: str, season_number: int, sort: str = "likes", page: int = 1, limit: int = 10) -> list[dict]:
+    return await _get_comments(client_id, f"/shows/{show_id}/seasons/{season_number}", sort, page, limit)
+
+
+async def get_episode_comments(
+    client_id: str, show_id: str, season_number: int, episode_number: int, sort: str = "likes", page: int = 1, limit: int = 10
+) -> list[dict]:
+    return await _get_comments(client_id, f"/shows/{show_id}/seasons/{season_number}/episodes/{episode_number}", sort, page, limit)

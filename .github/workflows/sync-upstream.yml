@@ -1,0 +1,67 @@
+name: Synchronisation Scrob officiel
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+env:
+  GH_REPO: ${{ github.repository }}
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+concurrency:
+  group: sync-scrob-upstream
+  cancel-in-progress: false
+jobs:
+  synchronisation:
+    if: github.repository == 'Aerya/scrob-arvio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Intégrer la branche officielle
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/ellite/scrob.git
+          git fetch upstream main --tags
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          git switch -c sync/scrob-officiel
+          git merge --no-edit upstream/main
+          git describe --tags --abbrev=0 upstream/main | sed 's/^v//' > UPSTREAM_VERSION
+          git add UPSTREAM_VERSION
+          git diff --cached --quiet || git commit -m 'Actualise la version officielle suivie'
+      - name: Valider avant publication
+        if: steps.merge.outputs.changed == 'true'
+        run: bash scripts/check-fork.sh
+      - name: Ouvrir et fusionner la mise à jour validée
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Refuse de remplacer une branche en cours ou une version main qui a changé.
+          git fetch origin main
+          git merge-base --is-ancestor origin/main HEAD
+          git push origin HEAD:sync/scrob-officiel
+          gh pr create --base main --head sync/scrob-officiel --title 'Synchroniser Scrob avec la version officielle' --body 'Intégration automatique de la branche officielle. Tests du backend, compilation Docker et contrôles TLS réussis avant publication. Les ajouts Bingebase du fork sont conservés.'
+          gh pr merge sync/scrob-officiel --merge --delete-branch --match-head-commit "$(git rev-parse HEAD)"
+          # Les pushes effectués avec GITHUB_TOKEN ne déclenchent pas les workflows push.
+          gh workflow run docker-x64.yml --ref main
+      - name: Signaler un blocage
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh issue list --state open --search 'in:title Synchronisation officielle bloquée' --json number --jq 'length')
+          if [ "$count" = 0 ]; then
+            gh issue create --title 'Synchronisation officielle bloquée' --body "La synchronisation ou sa validation a échoué. Aucun déploiement automatique n’est demandé en cas de conflit ou de test en échec. Examiner le workflow : https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi

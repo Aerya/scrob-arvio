@@ -1,3 +1,11 @@
+> **Fork maintenu : [Scrob officiel](https://github.com/ellite/scrob)** — version officielle suivie dans [`UPSTREAM_VERSION`](UPSTREAM_VERSION).
+>
+> ARVIO est désormais inclus dans l’officiel. Ce fork conserve surtout l’envoi automatique de l’historique vers Bingebase, son intervalle configurable et le suivi des envois échoués. Bingebase reste une intégration à sens unique, de Scrob vers Bingebase.
+>
+> La synchronisation quotidienne intègre la branche officielle, exécute les tests et les contrôles d’image, puis fusionne une PR et publie l’image si tout réussit. En cas de conflit ou de test en échec, la version publiée reste inchangée. Les bases de l’ancien fork ARVIO sont mises à niveau sans réinitialisation ; sauvegardez PostgreSQL avant toute mise à jour.
+>
+> **Maintained fork:** upstream version recorded in `UPSTREAM_VERSION`, with scheduled Bingebase history pushes and delivery failure accounting. Daily upstream updates are tested before merge/publication; failures leave the published version unchanged. Legacy ARVIO databases are upgraded without resetting migration history. Back up PostgreSQL before upgrading.
+
 <div align="center">
   <img src="frontend/public/scrob.png" alt="Scrob Logo" width="120" />
   <h1>Scrob</h1>
@@ -15,12 +23,6 @@
 
 Scrob syncs your libraries from **Jellyfin**, **Plex**, **Emby**, **Nuvio**, **ARVIO**, and **Stremio**, tracks your watch history, ratings, and personal lists, and can push watched activity back to connected providers - all from a clean, app-like web interface that installs as a PWA on any device.
 
-### TLS security — October 2026
-
-Update image trust stores and TLS components following the eMudhra incident. Checks cover the compromised chains, including both No CT cases, and a valid HTTPS connection. Running images remain unchanged: schedule their replacement after validation.
-
-[Incident details](https://emudhra.we-have-a-problem.com/) · [TLS checks](security/emudhra/README.md)
-
 ## Table of Contents
 
 - [Features](#features)
@@ -32,18 +34,22 @@ Update image trust stores and TLS components following the eMudhra incident. Che
   - [First Setup](#first-setup)
   - [Updating](#updating)
 - [Configuration](#configuration)
+  - [TheTVDB metadata](#thetvdb-metadata)
+  - [RPDB rating posters](#rpdb-rating-posters)
 - [ARVIO Cloud Synchronization](#arvio-cloud-synchronization)
 - [Nuvio Cloud Synchronization](#nuvio-cloud-synchronization)
   - [Connect Nuvio](#connect-nuvio)
   - [Synchronization Directions](#synchronization-directions)
   - [Scheduling and Limitations](#scheduling-and-limitations)
 - [Trakt Synchronization](#trakt-synchronization)
+- [Yamtrack / Floppy Import](#yamtrack--floppy-import)
 - [Stremio Synchronization](#stremio-synchronization)
   - [Connect Stremio](#connect-stremio)
   - [Stremio Synchronization Directions](#stremio-synchronization-directions)
   - [Scheduling, Full Resync, and Limitations](#scheduling-full-resync-and-limitations)
 - [Simkl Synchronization](#simkl-synchronization)
 - [MDBList Synchronization](#mdblist-synchronization)
+- [Watchlist](#watchlist)
 - [Webhooks](#webhooks-real-time-scrobbling)
   - [Jellyfin](#jellyfin)
   - [Plex](#plex)
@@ -68,21 +74,29 @@ Update image trust stores and TLS components following the eMudhra incident. Che
 - **Bingebase integration**: Push watch history and live scrobbles to your Bingebase account via personal Webhook URL.
 - **Watch history & ratings**: Track every movie and episode you've watched, including multiple plays with individual timestamps. Log plays manually with a custom date, or remove individual entries - all from the watched button on any movie or episode page. Rate them on a 10-point scale with optional reviews.
 - **Season ratings**: Rate individual seasons separately from the overall show.
+- **Rewatches**: Start a rewatch on any show and Scrob tracks progress for that cycle separately, without touching your original watch history.
+- **Watchlist**: One watchlist that Plex, Trakt, MDBList and Simkl all sync with, so a title added on any of them shows up once and reaches the others. See [Watchlist](#watchlist).
 - **Personal lists**: Create and curate lists of movies and shows. Mark them public to share with other users on the same instance.
 - **Comments**: Leave comments on movies, shows, seasons, and episodes.
 - **Social**: Follow other users and see their activity.
 - **Release schedule**: Movie pages show the full release schedule - theatrical, digital, and physical dates - sourced from TMDB.
 - **TMDB integration**: Rich metadata for every title - posters, backdrops, cast, crew, trailers, collections, and more.
+- **RPDB rating posters**: Optionally use RatingPosterDB movie and show posters with embedded ratings. Configure your own key and customize the artwork and rating sources through RPDB.
+- **Metadata language**: Set a preferred display language per profile - titles, overviews, and episode names show translated where available, independent of the rest of the UI's language.
 - **Search**: Search TMDB across movies, shows, people, and collections, merged with your local library data.
 - **Pick a Movie / Pick a Show**: Get a suggestion on what to watch next from your library or your streaming services based on your preferences.
 - **Trending & Airing Today**: Daily trending movies and shows from TMDB, plus episodes airing today filtered to your collection.
+- **Episode calendar**: A 15-day episode-by-episode schedule for shows you've collected or are watching.
 - **Continue Watching & Next Up**: Dashboard cards showing in-progress items and the next episode to watch in each series.
+- **Statistics**: A per-user stats page - watch time, activity charts, ratings breakdown, and most-watched people/networks - filterable by all-time, year, month, week, or a custom period.
 - **Season & episode tracking**: Detailed season views with per-episode watched state and progress.
+- **Episode ordering**: Watch a show in an alternate episode order - DVD, absolute, alternate or regional order from TheTVDB, or any TMDB episode group (story arc, production, digital). Chosen per show from the **Episode order** control on the show page; every surface the show's episodes appear on - show, season and episode pages, Next Up, Now Playing, the calendar, history and cards - renumbers to match. TheTVDB-sourced orders need a TheTVDB key; TMDB episode groups don't.
 - **Cast & crew pages**: Full filmography for any person, linked to your library.
 - **Radarr & Sonarr integration**: Add movies and shows to Radarr/Sonarr directly from the Scrob UI.
 - **Plex watchlist automation**: Automatically send items from your Plex watchlist (and selected friends' watchlists) to Radarr or Sonarr.
 - **Two-Factor Authentication**: TOTP-based 2FA with backup codes, managed from the settings page.
 - **OIDC / SSO**: Authenticate with any OpenID Connect provider (Authelia, Authentik, Keycloak, etc.).
+- **Logged-out browsing (opt-in)**: Public profiles and lists require an account to view by default. An admin can enable **Allow browsing without an account** in the admin panel to let visitors browse without signing in.
 - **Progressive Web App**: Install Scrob on any device - Android, iOS, or desktop - for a native app feel.
 - **Single container**: Frontend and backend ship as one image on one port. No separate services to manage.
 - **API documentation**: Full interactive OpenAPI docs at `/docs` (Swagger UI) and `/redoc` (ReDoc), useful if you're scripting against Scrob directly.
@@ -219,7 +233,7 @@ That's it - no database container, no `DATABASE_URL` to configure. PostgreSQL is
 
 **Switching to an external database later:** set `DATABASE_URL` in the environment and the embedded PostgreSQL will be skipped entirely. The omnibus image behaves identically to the standard image when `DATABASE_URL` is provided.
 
-> **Note:** The embedded PostgreSQL version is tied to the image's base OS (Debian Bookworm ships PostgreSQL 15). Major version upgrades of the bundled database require a manual data migration. If you anticipate needing to control the database version independently, use the standard two-container setup instead.
+> **Note:** The embedded PostgreSQL major version is pinned by the image (currently PostgreSQL 17, from Alpine's `postgresql17` package). Major version upgrades of the bundled database require a manual data migration. If you anticipate needing to control the database version independently, use the standard two-container setup instead.
 
 ### Docker Run
 
@@ -291,12 +305,28 @@ Database migrations run automatically on startup - no manual steps required.
 | `DATABASE_URL` | - | **Required** (standard image). PostgreSQL connection string (`postgresql+asyncpg://...`). Optional on the omnibus image - if omitted, the embedded database is used. |
 | `ENABLE_REGISTRATIONS` | `false` | Allow new users to register. The first user can always register regardless of this setting. |
 | `REGISTRATION_MAX_ALLOWED_USERS` | `0` | Maximum number of registered users. `0` = unlimited. |
+| `SESSION_REMEMBER_DAYS` | `30` | How long a login lasts when **Stay logged in** is ticked on the login page, for password and SSO logins. Without it a login lasts 7 days. |
+| `LIST_IMPORT_MAX_ITEMS` | `10000` | Maximum number of items imported from a TMDB, TVDB, IMDb or MDBList list. Imports run in the background; a list longer than this is cut off and the import dialog says so. |
 | `TZ` | `UTC` | Container timezone (e.g. `Europe/Lisbon`). |
 | `PUID` | `1000` | User ID to run the process as. |
 | `PGID` | `1000` | Group ID to run the process as. |
 | `BACKEND_PORT` | `7331` | Internal port the backend binds to. Override only if `7331` conflicts on bare metal. |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Setting `WARNING` or higher hides the per-request access log entirely. |
+| `ACCESS_LOG_EXCLUDE` | webhooks and polled endpoints | Comma-separated path prefixes whose successful requests (status below 400) are not access-logged. Failed requests are always logged. Defaults to `/webhooks/,/auth/me,/auth/settings,/auth/session/renew,/sync/status,/history/now-playing,/admin/requests/pending-count`. Set it to an empty value to log every request. |
 | `OIDC_ENABLED` | `false` | Enable OIDC login. |
+| `OIDC_DISCOVERY_URL` | - | OpenID discovery document URL. When set, Scrob validates `id_token` signatures (JWKS), issuer, audience, and nonce. |
 | `OIDC_DISABLE_PASSWORD_LOGIN` | `false` | Enforce OIDC-only login (disables username/password). |
+
+#### Reducing log noise
+
+By default Scrob does not log the successful webhook calls (media servers post on every playback progress tick) or the endpoints the web UI polls. To go further:
+
+```yaml
+environment:
+  LOG_LEVEL: WARNING                                   # no per-request lines at all
+  # ACCESS_LOG_EXCLUDE: "/webhooks/,/history/"         # or choose your own noisy prefixes
+  # ACCESS_LOG_EXCLUDE: ""                             # or log every request again
+```
 
 See `docker-compose.yaml` for the full list of OIDC variables and other variables.
 
@@ -318,6 +348,35 @@ Remove the `scrob-db` service and set `DATABASE_URL` to your existing instance:
 ```yaml
 DATABASE_URL: postgresql+asyncpg://user:password@your-db-host:5432/scrob
 ```
+
+### TheTVDB metadata
+
+TMDB covers the great majority of titles. A **TheTVDB** key is optional and only affects TVDB-specific paths:
+
+- shows and episodes that exist on TheTVDB but not on TMDB;
+- alternate episode orderings from TheTVDB - DVD, absolute (common for anime), alternate, regional - plus TVDB season metadata, selectable per show under **Episode order** (TMDB episode groups work without a key);
+- matching otherwise-unmatched local episodes through TheTVDB.
+
+With no key configured, all of the above fall back to TMDB-only behaviour; nothing else is affected.
+
+**Which credential to get.** TheTVDB v4 has two key types:
+
+| Type | Where | Auth | Notes |
+|---|---|---|---|
+| Free **project** key | [thetvdb.com/api-information](https://thetvdb.com/api-information) | API key only | Free for projects under the revenue threshold in TheTVDB's terms. Requires attribution — Scrob displays a "Metadata provided by TheTVDB" link on every TVDB-sourced page and in **About**. |
+| **Subscriber-supported** key | TheTVDB dashboard | API key **+ subscriber PIN** | Enter both the key and the PIN in Scrob. |
+
+Configure it per-user in **Settings → General → TVDB API Key** (with the **Subscriber PIN** field for a subscriber key), or server-wide in **Admin → Settings → TVDB** as a fallback for all users. Use **Test key** to verify the pair before saving.
+
+**Rotation / revocation.** Scrob caches the TheTVDB login token in memory for up to 29 days per key. After changing or removing the key or PIN in settings, the new credential takes effect on the next lookup; a stale token for the old credential is discarded on restart.
+
+### RPDB rating posters
+
+To enable [RatingPosterDB](https://ratingposterdb.com/) posters, enter your RPDB API key in **Settings → General → RPDB API Key**, test it, and save. This is a personal display preference: it applies only to your browsing, including when viewing another user's public profile or list. Clear the key and save to return to the original artwork.
+
+Choose poster styles and rating sources in the [RPDB manager](https://manager.ratingposterdb.com/); available customizations depend on your RPDB plan. Scrob uses RPDB's account-default posters and falls back to the original artwork when an RPDB image cannot load. Movie and show portraits, including parent-show portraits in history and Next Up, can use RPDB. Episode stills, season-specific artwork, backdrops, people and collection artwork stay unchanged.
+
+Rating posters are fetched server-side through the same image proxy as TMDB and TheTVDB artwork, so your key stays on the server and is never placed in the page. It is not written into shared media metadata, and data exports include it only when you explicitly select **API Keys**. Existing metadata and the server's image cache are unchanged.
 
 ## ARVIO Cloud Synchronization
 
@@ -341,18 +400,22 @@ The GitHub Actions workflow (`.github/workflows/docker-x64.yml`) automatically v
 
 ## Nuvio Cloud Synchronization
 
-Scrob connects to the [Nuvio public Cloud API](https://nuvio.tv/docs) at `https://api.nuvio.tv`. A TMDB Read Access Token must be configured in Scrob so Nuvio content identifiers can be matched to movies and shows.
+Scrob connects to the [Nuvio public Cloud API](https://nuvio.tv/docs) at `https://api.nuvio.tv` by default and also supports self-hosted Nuvio backends. A TMDB Read Access Token must be configured in Scrob so Nuvio content identifiers can be matched to movies and shows.
 
 ### Connect Nuvio
 
 1. Open **Connections → Media Players** and select **Add Connection**.
-2. Choose **Nuvio**, then enter a connection name, your Nuvio email, and your Nuvio password.
+2. Choose **Nuvio**, then enter a connection name, your Nuvio email, and your Nuvio password. To use a self-hosted backend, replace the default Cloud API URL with its Supabase project URL.
 3. Select **Test** to authenticate and load the profiles attached to the account.
 4. Select the Nuvio profile to synchronize, choose the pull and push options, then select **Add**.
 
 Scrob exchanges the email and password for a refresh token. The password is never persisted. Refresh-token rotation is handled automatically during connection checks and synchronization.
 
 Each connection targets one Nuvio profile. Add another connection if you need to synchronize another profile from the same account.
+
+### Self-hosted Backends
+
+Set `NUVIO_APP_ANON_KEY` to the anon/public key for your self-hosted Nuvio Supabase project, then enter that project's URL in the editable **Cloud API URL** field when adding the connection. If the variable is unset, Scrob continues to use the official Nuvio publishable key.
 
 ### Synchronization Directions
 
@@ -372,6 +435,8 @@ Ratings are not synchronized with Nuvio.
 ### Scheduling and Limitations
 
 **Auto Pull** and **Auto Push** can run independently every 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours, 24 hours, or 48 hours. Nuvio synchronization is polling-based; Nuvio does not use the media-server webhook URLs documented below.
+
+For Plex, Jellyfin, Emby and Nuvio, an Auto Push only sends what changed since the previous push: ratings and watched status the server already received with the same value are skipped, and items that were not found on the server are not searched for again for 24 hours. The **Push** button always reconciles everything, and Auto Push does the same once a week, so a value edited directly on the server is put back within a week at most.
 
 Inbound Nuvio identifiers are normalized to TMDB for Scrob's internal matching. Before an outbound push, Scrob resolves those TMDB identifiers to Nuvio-compatible bare IMDb identifiers (`tt...`) and caches the mapping. Unsupported identifiers are skipped rather than attached to the wrong title.
 
@@ -401,6 +466,16 @@ Trakt now requires a **Trakt VIP** subscription to create a new API application 
 Re-uploading a newer export is safe to do any time you want to catch up on new activity - imported watch plays and ratings are deduplicated, so nothing is imported twice.
 
 **Auto Pull** and **Auto Push** apply only to the OAuth connection and can run independently every 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours, 24 hours, or 48 hours.
+
+## Yamtrack / Floppy Import
+
+Scrob can import a one-time CSV export from [Yamtrack](https://github.com/FuzzyGrim/Yamtrack) or its fork [Floppy](https://github.com/dannyvfilms/Floppy).
+
+1. Export your data from Yamtrack or Floppy (their respective **Export** page).
+2. In Scrob, open **Connections → Import**, select the **Yamtrack** tab, then drop the `.csv` file on the upload box.
+3. Choose what to import - watched history, ratings, and comments are always available. Collection and lists are only populated by a **Floppy** export; a vanilla Yamtrack export doesn't include them, so those options add nothing.
+
+This is a pull-only, one-shot import, like the Trakt export path above - there's no ongoing sync or connection left behind afterward. Re-uploading a newer export is safe; imported items are deduplicated. Requires a TMDB Read Access Token configured in Scrob.
 
 ## Stremio Synchronization
 
@@ -442,21 +517,22 @@ Stremio exposes a current watched state rather than Scrob's complete per-play hi
 
 ## Simkl Synchronization
 
-1. Create a Simkl application at [simkl.com/settings/developer](https://simkl.com/settings/developer) to get a Client ID.
-2. Open **Connections → Media Trackers → Simkl**, paste the Client ID in, and select **Connect Simkl**.
-3. Go to the shown URL and enter the displayed PIN to authorize, on simkl.com.
-4. Choose what to import under **Simkl → Scrob**, then select **Pull**.
-5. Enable the desired **Scrob → Simkl** options to push watched status, ratings, or live scrobbling back to Simkl.
+1. Open **Connections → Media Trackers → Simkl** and select **Connect Simkl**. There is no app to register or Client ID to enter.
+2. Go to the shown URL and enter the displayed PIN to authorize, on simkl.com.
+3. Choose what to import under **Simkl → Scrob**, then select **Pull**.
+4. Enable the desired **Scrob → Simkl** options to push watched status, ratings, or live scrobbling back to Simkl.
 
-Simkl uses PIN-based authentication - no client secret is needed.
+Scrob signs in with Simkl's AUTH V2 device flow through its own Simkl app, and refreshes the short-lived tokens automatically in the background. Connections made earlier through Simkl's retiring AUTH V1 keep working until Simkl switches it off (expected around April 2027); disconnect and connect again to move to V2.
 
 | Direction | Setting | Behavior |
 |---|---|---|
 | Simkl → Scrob | **Watched history** | Imports watched movies and episodes. |
 | Simkl → Scrob | **Ratings** | Imports ratings. |
-| Simkl → Scrob | **Lists / Watchlist** | Imports "plan to watch" items into a managed **Simkl - Watchlist** list. |
+| Simkl → Scrob | **Lists / Watchlist** | Syncs "plan to watch" items into the [Watchlist](#watchlist): new ones are added, ones removed on Simkl are removed. |
+| Simkl → Scrob | **Dropped shows** | Marks shows you dropped on Simkl as dropped in Scrob. Only shows Scrob already knows are marked, and a show un-dropped on Simkl is not un-dropped in Scrob. Off by default. |
 | Scrob → Simkl | **Watched status** | Pushes watched and unwatched changes made in Scrob or imported from another connected provider. |
 | Scrob → Simkl | **Ratings** | Pushes rating changes. |
+| Scrob → Simkl | **Dropped shows** | Moves shows you drop in Scrob to Simkl's Dropped list, and the manual **Push** or **Auto Push** adds any that are missing. Un-dropping in Scrob moves a show that is still in Simkl's Dropped list to **Completed** (ended and fully watched), **Watching** (some episodes watched) or **On Hold** (nothing watched). A show you have since moved to another list on Simkl is left alone. Off by default. |
 | Scrob → Simkl | **Live scrobbling** | Pushes playback start/stop events from webhooks and manual scrobble sessions in real time. |
 
 The manual **Push** action sends the complete enabled watched-history and ratings snapshot, in batches of 50 items per request. Collection membership and the Simkl watchlist are not pushed back to Simkl.
@@ -468,11 +544,34 @@ The manual **Push** action sends the complete enabled watched-history and rating
 1. Open **Connections → Media Trackers → MDBList**.
 2. Copy the API key from [MDBList Preferences](https://mdblist.com/preferences), paste it into Scrob, and select **Save Changes**.
 3. Choose the data to import under **MDBList → Scrob**, then select **Pull**. MDBList pulls run only when this button is selected.
-4. To send changes back, enable the required **Scrob → MDBList** options. Watched-state and rating edits are pushed as they happen; edits to the managed **MDBList - Watchlist** are pushed to the MDBList watchlist.
+4. To send changes back, enable the required **Scrob → MDBList** options. Watched-state and rating edits are pushed as they happen; edits to the [Watchlist](#watchlist) are pushed to the MDBList watchlist.
 
-The manual **Push** action sends the complete enabled watched, ratings, or managed-watchlist snapshot. MDBList pagination follows `next_cursor` and requests the documented maximum of 1,000 items per page.
+The manual **Push** action sends the complete enabled watched or ratings snapshot and reconciles the watchlist. MDBList pagination follows `next_cursor` and requests the documented maximum of 1,000 items per page.
 
 **Auto Pull** and **Auto Push** can run independently every 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours, 24 hours, or 48 hours.
+
+## Watchlist
+
+Every user has one **Watchlist**, shown first under **Lists**. It can't be deleted. Plex, Trakt, MDBList and Simkl all sync their watchlist with it, instead of each filling a list of its own, so Scrob works as the hub between them:
+
+- A title added on one service lands on the Watchlist once, and goes out to every other service with watchlist push enabled on its next sync.
+- A title removed on a service is removed from the Watchlist, and then from the other services with push enabled.
+- A title added or removed in Scrob is pushed to those services right away.
+
+Each service remembers what its watchlist looked like after its last sync, so it can tell a removal from a title that was never there. A service that only pulls (Simkl, or any service with push off) adds and removes only what changed on that service, and never removes titles that came from somewhere else. A sync that would remove more than half of a watchlist of 10 or more titles is skipped as a probably broken fetch.
+
+| Service | Pull setting | Push setting |
+|---|---|---|
+| Plex | **Watchlist** under the connection's import options | **Watchlist** under its push options |
+| Trakt | **Lists** | **Lists** |
+| MDBList | **Watchlist** | **Watchlist** |
+| Simkl | **Lists / Watchlist** | none (Simkl has no watchlist push) |
+
+Only whole movies and shows take part. Seasons added to the Watchlist stay in Scrob.
+
+API clients use `GET /api/proxy/lists/watchlist` to get the Watchlist's id, then the usual `/api/proxy/lists/{id}/items` endpoints.
+
+When upgrading from a version with per-service lists, the "Trakt - Watchlist", "Plex - Watchlist", "MDBList - Watchlist" and "Simkl - Watchlist" lists are merged into the Watchlist, without duplicates. The old lists are kept, renamed with "(old)", and no longer sync. Delete them once you've checked the Watchlist. The first sync of each service after the upgrade only adds titles and never removes any.
 
 ## Webhooks (Real-time Scrobbling)
 
@@ -505,38 +604,84 @@ Plex webhooks require a **Plex Pass** subscription.
 2. Paste your Scrob Plex webhook URL.
 3. In Scrob → Connections, enter your **Plex username** so events are attributed to the right account.
 
+#### Playback progress to Plex
+
+Turn on **Scrob → Plex → Playback progress** on a Plex connection to send Scrob's Continue Watching to Plex, so a movie or episode you stopped part way on another player (Kodi, Jellyfin, Emby, or an app using Scrob's player webhook) shows as in progress in Plex and resumes there.
+
+- **Push** and **Auto Push** write every resume point to Plex, looking titles up in the Plex libraries when Scrob hasn't seen them on that server yet. Auto Push skips positions it already sent.
+- A stop from a player other than Plex is sent right away, without waiting for Auto Push, for titles Scrob has already seen on that Plex server. Others follow on the next push.
+- Scrob never moves Plex backwards: a title Plex played more recently than Scrob recorded its position is left alone.
+
+Like the other Plex pushes, this uses the connection's token, so it sets the resume point of the Plex account that token belongs to.
+
 ### Emby
 
 1. In Emby, go to **Dashboard → Notifications → Add Notification → Webhook**.
 2. Paste your Scrob Emby webhook URL.
-3. Enable events: `Playback Start`, `Playback Progress`, `Playback Stop`, `Item Added`, `Item Deleted`.
+3. Enable events: `Playback Start`, `Playback Stop`, `Item Added`, `Item Deleted`.
+
+> Emby's webhook plugin has no separate "playback progress" event, so the Now Playing bar's live progress instead comes from Scrob polling Emby's own Sessions API in the background - no extra configuration needed.
 
 ### Kodi
 
 Kodi scrobbling uses the **[scrob-kodi](https://github.com/ellite/scrob-kodi)** add-on - no manual webhook configuration needed.
 
 1. Install the **scrob-kodi** add-on from the [scrob-kodi repository](https://github.com/ellite/scrob-kodi).
-2. In the add-on settings, enter your Scrob URL and your API key (found in **Connections → API Key**).
+2. In the add-on settings, enter your Scrob URL, then either:
+   - **Authorize with Scrob** (recommended) - the add-on shows a short code; open `your-scrob-url/link` in a browser, sign in, and approve. This works with 2FA accounts, never exposes your password, and the device can be revoked on its own from **Connections → Connected Apps**.
+   - or paste your **API key** (found in **Connections → API Key**) - still fully supported, and the only option if your Scrob instance predates device linking.
 3. The add-on will automatically send playback events to Scrob as you watch.
+
+The `POST /api/proxy/webhooks/kodi` endpoint (and the `kodi/history`, `kodi/ratings`, `kodi/rating` helpers the add-on uses for library sync) accept either an `Authorization: Bearer` device token or the `?api_key=` query parameter.
 
 ## OIDC / Single Sign-On
 
-Scrob supports any OpenID Connect provider (Authelia, Authentik, Keycloak, Google, etc.).
+Scrob supports any standards-compliant OpenID Connect provider (Authelia, Authentik, Keycloak, Google, etc.). Login flow is authorization-code with PKCE; when discovery is configured the `id_token` is signature-verified (JWKS) and identity is bound on the IdP's stable `(issuer, sub)` pair so a changed email never breaks the account.
+
+### Prerequisites
+
+- Register Scrob as a client at your IdP with redirect URI `https://scrob.yourdomain.com/oidc-callback`.
+
+### Minimal config
+
+Add these to the `environment:` section of the `scrob` service in your `docker-compose.yaml` (or `docker-compose.yml` for the omnibus image), or to your `.env` file if you run from source — same place as `DATABASE_URL`, `SECRET_KEY`, and the SMTP vars.
 
 ```yaml
 OIDC_ENABLED: "true"
-OIDC_PROVIDER_NAME: "Authelia"
+OIDC_PROVIDER_NAME: "Authentik"
 OIDC_CLIENT_ID: "scrob"
 OIDC_CLIENT_SECRET: "your-secret"
-OIDC_AUTH_URL: "https://auth.yourdomain.com/api/oidc/authorization"
-OIDC_TOKEN_URL: "https://auth.yourdomain.com/api/oidc/token"
-OIDC_USERINFO_URL: "https://auth.yourdomain.com/api/oidc/userinfo"
+OIDC_AUTH_URL: "https://auth.yourdomain.com/application/o/authorize/"
+OIDC_TOKEN_URL: "https://auth.yourdomain.com/application/o/token/"
+OIDC_USERINFO_URL: "https://auth.yourdomain.com/application/o/userinfo/"
 OIDC_REDIRECT_URL: "https://scrob.yourdomain.com/oidc-callback"
+# Recommended — enables id_token signature verification and (issuer, sub) binding:
+OIDC_DISCOVERY_URL: "https://auth.yourdomain.com/application/o/scrob/.well-known/openid-configuration"
+# Optional — enables RP-initiated SSO logout (populated from discovery when unset):
+# OIDC_LOGOUT_URL: "https://auth.yourdomain.com/application/o/scrob/end-session/"
+# OIDC_SCOPES: "openid email profile"     # default shown
+# OIDC_IDENTIFIER_FIELD: "email"          # userinfo field used only in compat mode
+# OIDC_ISSUER / OIDC_JWKS_URL             # explicit fallbacks when discovery isn't available
 OIDC_AUTO_CREATE_USERS: "true"
 # OIDC_DISABLE_PASSWORD_LOGIN: "true"  # uncomment to enforce SSO-only
 ```
 
-Register Scrob as a client in your provider with redirect URI: `https://scrob.yourdomain.com/oidc-callback`
+### What users see
+
+- The login page shows a **Login with {OIDC_PROVIDER_NAME}** button. If `OIDC_DISABLE_PASSWORD_LOGIN=true`, the password form is hidden and the registration link is removed.
+- First SSO login creates a Scrob account automatically unless `OIDC_AUTO_CREATE_USERS=false`. In that case only pre-existing accounts (matched by verified email) can sign in via SSO.
+- Settings → Security shows the linked SSO provider and offers an **Unlink** button. Unlink is refused when it would lock the user out (no password set, SSO-only mode on, and the identity is the only one).
+
+### MFA, logout, and account linking
+
+- SSO uses the IdP's MFA (number-matching push, passkey, TOTP, etc.). Scrob's own TOTP only runs on password logins.
+- If `OIDC_LOGOUT_URL` is set (or `end_session_endpoint` is present in your discovery document), logging out of Scrob also ends the IdP session. Otherwise Scrob just clears its own cookie — leave it unset for providers that don't offer RP-initiated logout (e.g. Google).
+- Existing local accounts with the same **verified** email as the SSO user are linked automatically on first SSO login - the account, library, and TOTP all stay. Scrob never links to an account whose IdP marks `email_verified: false`.
+
+### Notes
+
+- Setting `OIDC_DISCOVERY_URL` (or both `OIDC_ISSUER` and `OIDC_JWKS_URL`) enables `id_token` signature verification and `(issuer, sub)` identity binding. Without them, Scrob matches users by the `OIDC_IDENTIFIER_FIELD` userinfo claim and logs a warning on first login.
+- The first account created on an empty Scrob instance becomes admin, whether that happens via local registration or SSO. Group and role claims from the IdP are ignored.
 
 ## Email Validation & SMTP
 
@@ -622,6 +767,26 @@ npm run dev
 ```
 
 The frontend dev server starts on `http://localhost:4321` and proxies API calls to the backend on `7331`.
+
+### UI text and translations
+
+User-facing text lives in message catalogs in `frontend/messages/`, compiled by [Paraglide JS](https://inlang.com/m/gerre34r/library-inlang-paraglideJs). New text goes into `en.json`; the other catalogs hold its translations, and a string missing from one shows in English.
+
+1. Add a key to `frontend/messages/en.json`, prefixed with the page or area (`history_empty`). Reuse a `common_*` key when one fits.
+2. Call it in frontmatter or in a `<script>`: `import { m } from "../paraglide/messages.js"`, then `m.history_empty()`, or `m.episodes_left({ count })` with parameters. A key that doesn't exist fails `npm run build`.
+3. Format dates and numbers with the helpers in `frontend/src/lib/format.ts` (`formatDate`, `formatNumber`, ...) rather than `toLocaleString()`, so they follow the UI language and the viewer's region.
+
+In VS Code, the [Sherlock](https://marketplace.visualstudio.com/items?itemName=inlang.vs-code-extension) extension shows each message's English text next to its `m.*()` call, and extracts selected text into a new key.
+
+Plurals use the variant format (see `episodes_left` in `en.json`), with a `=*` catch-all. A message rendered with `set:html` may contain markup: pass every interpolated value through `escapeHtml` from `format.ts`.
+
+#### Adding a language
+
+1. Add its code to `locales` in `frontend/project.inlang/settings.json`, for example `["en", "fr", "de"]`. A regional variant is a tag such as `pt-PT` (European Portuguese, shipped); the file is then `pt-PT.json`.
+2. Create `frontend/messages/<code>.json` (copy `en.json` as a starting point) and translate the values. A key left out shows in English, so a partial translation works.
+3. Rebuild the frontend (restart the dev server if it is running).
+
+The language shows up in the pickers (Settings and the signed-out pages) on its own: English comes first, the rest follow in order of language code, and each is labelled in its own language ("Deutsch", "Français"), generated from the browser's built-in language data. The backend needs no change: it only checks that a saved code looks like a language code, and a code that isn't shipped falls back to English. English is the default, so a user only sees another language after picking it.
 
 </details>
 

@@ -9,7 +9,10 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from db import engine, Base
 import models # noqa: F401
-from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, mdblist, bingebase, comments, admin, compat, export
+from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, wetrakr, mdblist, bingebase, comments, admin, compat, export, yamtrack, calendar, saved_filters
+
+from core.access_log import install as install_access_log_redaction
+install_access_log_redaction()
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -18,6 +21,8 @@ from core.limiter import limiter
 
 from sqlalchemy import or_, select, update, delete
 from models.sync import SyncJob, SyncStatus
+from core.job_retention import prune_old_sync_jobs
+from core import tmdb
 from models.base import CollectionSource
 from models.playback_session import PlaybackSession
 
@@ -38,19 +43,29 @@ async def _auto_sync_scheduler():
     )
     from routers.trakt import run_trakt_sync, _run_trakt_push
     from routers.simkl import run_simkl_sync, _run_simkl_push
+    from routers.wetrakr import run_wetrakr_sync, _run_wetrakr_push
     from routers.mdblist import run_mdblist_sync, run_mdblist_push
-    from routers.bingebase import run_bingebase_sync, run_bingebase_push
+    from routers.bingebase import run_bingebase_push
 
-    # Trakt/Simkl/MDBList/Bingebase are single, user-level cloud connections (no
+    # Trakt/Simkl/MDBList are single, user-level cloud connections (no
     # MediaServerConnection row, no connection_id) — same due-date logic as
     # the media-connection loop below, just keyed by user_id + source alone.
     cloud_sync_config = [
+        {
+            "source": CollectionSource.bingebase,
+            "connected_field": "bingebase_webhook_url",
+            "auto_sync_field": "bingebase_auto_sync_interval",
+            "auto_push_field": "bingebase_auto_push_interval",
+            "push_flags": ("bingebase_push_watched",),
+            "pull_runner": None,  # Bingebase accepts webhooks, no pull API.
+            "push_runner": run_bingebase_push,
+        },
         {
             "source": CollectionSource.trakt,
             "connected_field": "trakt_access_token",
             "auto_sync_field": "trakt_auto_sync_interval",
             "auto_push_field": "trakt_auto_push_interval",
-            "push_flags": ("trakt_push_watched", "trakt_push_ratings", "trakt_push_collection"),
+            "push_flags": ("trakt_push_watched", "trakt_push_ratings", "trakt_push_collection", "trakt_push_dropped"),
             "pull_runner": run_trakt_sync,
             "push_runner": _run_trakt_push,
         },
@@ -59,9 +74,18 @@ async def _auto_sync_scheduler():
             "connected_field": "simkl_access_token",
             "auto_sync_field": "simkl_auto_sync_interval",
             "auto_push_field": "simkl_auto_push_interval",
-            "push_flags": ("simkl_push_watched", "simkl_push_ratings"),
+            "push_flags": ("simkl_push_watched", "simkl_push_ratings", "simkl_push_dropped"),
             "pull_runner": run_simkl_sync,
             "push_runner": _run_simkl_push,
+        },
+        {
+            "source": CollectionSource.wetrakr,
+            "connected_field": "wetrakr_access_token",
+            "auto_sync_field": "wetrakr_auto_sync_interval",
+            "auto_push_field": "wetrakr_auto_push_interval",
+            "push_flags": ("wetrakr_push_watched", "wetrakr_push_ratings"),
+            "pull_runner": run_wetrakr_sync,
+            "push_runner": _run_wetrakr_push,
         },
         {
             "source": CollectionSource.mdblist,
@@ -73,18 +97,10 @@ async def _auto_sync_scheduler():
                 "mdblist_push_ratings",
                 "mdblist_push_watchlist",
                 "mdblist_push_collection",
+                "mdblist_push_dropped",
             ),
             "pull_runner": run_mdblist_sync,
             "push_runner": run_mdblist_push,
-        },
-        {
-            "source": CollectionSource.bingebase,
-            "connected_field": "bingebase_webhook_url",
-            "auto_sync_field": "bingebase_auto_sync_interval",
-            "auto_push_field": "bingebase_auto_push_interval",
-            "push_flags": ("bingebase_push_watched", "bingebase_push_ratings"),
-            "pull_runner": run_bingebase_sync,
-            "push_runner": run_bingebase_push,
         },
     ]
 
@@ -104,11 +120,23 @@ async def _auto_sync_scheduler():
         "stremio": run_stremio_sync,
     }
 
+    import logging
+    log = logging.getLogger("uvicorn.error")
+    last_prune = datetime.min
     while True:
         await asyncio.sleep(check_interval)
         try:
             async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
             async with async_session() as db:
+                if datetime.now(timezone.utc).replace(tzinfo=None) - last_prune >= timedelta(hours=1):
+                    last_prune = datetime.now(timezone.utc).replace(tzinfo=None)
+                    try:
+                        pruned = await prune_old_sync_jobs(db)
+                        if pruned:
+                            log.info(f"Pruned {pruned} sync jobs older than 7 days")
+                    except Exception as e:
+                        log.error(f"Sync job pruning failed: {e}")
+                        await db.rollback()
                 result = await db.execute(
                     select(MediaServerConnection).where(
                         or_(
@@ -142,15 +170,7 @@ async def _auto_sync_scheduler():
                     schedules: list[tuple[str, float, object]] = []
                     if conn.auto_sync_interval is not None:
                         schedules.append(("pull", conn.auto_sync_interval, pull_runner))
-                    if (
-                        conn.auto_push_interval is not None
-                        and (
-                            conn.push_collection
-                            or conn.push_watched
-                            or conn.push_playback
-                            or conn.push_ratings
-                        )
-                    ):
+                    if conn.auto_push_interval is not None and conn.push_enabled:
                         schedules.append(("push", conn.auto_push_interval, _run_full_push))
 
                     due: list[tuple[datetime, str, object]] = []
@@ -196,7 +216,9 @@ async def _auto_sync_scheduler():
                         f"connection {conn.id} (job {job_id})"
                     )
                     if job_type == "push":
-                        asyncio.create_task(runner(conn.user_id, conn.id, job_id))
+                        # Scheduled pushes skip what an earlier push already sent (#421, #422);
+                        # a manual push still reconciles everything.
+                        asyncio.create_task(runner(conn.user_id, conn.id, job_id, incremental=True))
                     else:
                         asyncio.create_task(runner(conn.user_id, job_id, 0, 0, conn.id))
 
@@ -239,7 +261,7 @@ async def _auto_sync_scheduler():
                             continue
 
                         schedules: list[tuple[str, float, object]] = []
-                        if auto_sync is not None:
+                        if auto_sync is not None and cfg["pull_runner"] is not None:
                             schedules.append(("pull", auto_sync, cfg["pull_runner"]))
                         if auto_push is not None and any(
                             getattr(settings_row, flag) for flag in cfg["push_flags"]
@@ -306,6 +328,317 @@ async def _manual_session_completer():
                 await auto_complete_manual_sessions(db)
         except Exception as e:
             print(f"Manual session completer error: {e}")
+
+
+async def _emby_progress_poller():
+    """Emby's webhook system has no progress event (only start/pause/unpause/
+    stop), so a PlaybackSession opened by an Emby webhook freezes at the last
+    event's position until the next one (#240). Jellyfin doesn't need this:
+    its Webhook plugin can send PlaybackProgress, which /webhook/jellyfin
+    already handles.
+
+    Polls the Emby Sessions API for connections with playback sync enabled and
+    refreshes the progress/state of sessions the webhooks already opened.
+    Sessions without a matching PlaybackSession row are ignored, so the
+    webhook flow stays the source of truth."""
+    import logging
+    log = logging.getLogger("uvicorn.error")
+
+    try:
+        import httpx
+        from datetime import datetime
+        from db import AsyncSessionLocal
+        from models.connections import MediaServerConnection
+    except Exception as e:
+        log.error(f"Emby progress poller: failed to import dependencies: {e}")
+        return
+
+    POLL_INTERVAL = 60
+    log.info("Emby progress poller: started")
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            async with AsyncSessionLocal() as db:
+                conns = (await db.execute(
+                    select(MediaServerConnection).where(
+                        MediaServerConnection.type == "emby",
+                        MediaServerConnection.sync_playback.is_(True),
+                    )
+                )).scalars().all()
+                for conn in conns:
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            resp = await client.get(
+                                f"{conn.url.rstrip('/')}/Sessions",
+                                headers={"X-Emby-Token": conn.token},
+                            )
+                            resp.raise_for_status()
+                            sessions = resp.json()
+                    except Exception:
+                        continue
+                    for s in sessions:
+                        item = s.get("NowPlayingItem") or {}
+                        play_state = s.get("PlayState") or {}
+                        runtime = item.get("RunTimeTicks") or 0
+                        position = play_state.get("PositionTicks") or 0
+                        if not runtime or not position:
+                            continue
+                        key = f"emby:{conn.user_id}:{s.get('Id')}"
+                        row = (await db.execute(
+                            select(PlaybackSession).where(PlaybackSession.session_key == key)
+                        )).scalar_one_or_none()
+                        if not row:
+                            continue
+                        row.progress_percent = round(position / runtime, 4)
+                        row.progress_seconds = int(position / 10_000_000)
+                        row.state = "paused" if play_state.get("IsPaused") else "playing"
+                        row.updated_at = utcnow()
+                        # Commit per-row via the shared helper (routers/webhooks.py):
+                        # a PlaybackStop webhook can delete this same session between
+                        # the select above and this write, which SQLAlchemy surfaces
+                        # as a StaleDataError. Batching every session into one final
+                        # commit would let that one race discard every other Emby
+                        # session's progress for this whole poll cycle - tolerating
+                        # it per-row keeps the blast radius to just that session.
+                        await webhooks._commit_playback_session_update(db)
+        except Exception as e:
+            log.error(f"Emby progress poller: {e}")
+
+
+async def _refresh_tvdb_shows(db, log, is_fresh) -> None:
+    """Daily refresh of TVDB-sourced shows (tmdb_data.source == "tvdb").
+
+    Their stored season list and status are otherwise only written when
+    someone opens the show page, so Next Up and the calendar (which read that
+    snapshot) would never learn about a new season or an ended show. Only the
+    TVDB-shaped fields are rewritten; title/overview stay as they are.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from models.show import Show
+    from models.global_settings import GlobalSettings
+    from models.users import User, UserSettings
+    from core import tvdb as tvdb_client
+
+    shows = [
+        s for s in (await db.execute(select(Show).where(Show.tvdb_id.isnot(None)))).scalars().all()
+        if (s.tmdb_data or {}).get("source") == "tvdb" and not is_fresh(s)
+    ]
+    if not shows:
+        return
+
+    # Same "any valid key" reasoning as the TMDB sweep: global, then an
+    # admin's, then any user's (with that key's own subscriber PIN).
+    gs = (await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))).scalar_one_or_none()
+    api_key, pin = (gs.tvdb_api_key, gs.tvdb_subscriber_pin) if gs else (None, None)
+    if not api_key:
+        row = (await db.execute(
+            select(UserSettings.tvdb_api_key, UserSettings.tvdb_subscriber_pin)
+            .join(User, User.id == UserSettings.user_id)
+            .where(UserSettings.tvdb_api_key.isnot(None))
+            .order_by(User.is_admin.desc())
+            .limit(1)
+        )).first()
+        api_key, pin = (row[0], row[1]) if row else (None, None)
+    if not api_key:
+        return
+    tvdb_client.set_subscriber_pin(api_key, pin)
+
+    sem = asyncio.Semaphore(5)
+    refreshed = 0
+
+    async def _check(show):
+        nonlocal refreshed
+        async with sem:
+            try:
+                raw = await tvdb_client.get_series(show.tvdb_id, api_key, cache_ttl=None)
+            except Exception:
+                return
+        data = tvdb_client.format_series(raw, language=tvdb_client.tvdb_language(None))
+        show.status = data.get("status") or show.status
+        show.first_air_date = data.get("first_air_date") or show.first_air_date
+        show.last_air_date = data.get("last_air_date") or show.last_air_date
+        show.tmdb_data = {
+            **(show.tmdb_data or {}),
+            "seasons": data.get("seasons") or (show.tmdb_data or {}).get("seasons", []),
+            "genres": data.get("genres") or (show.tmdb_data or {}).get("genres", []),
+            "source": "tvdb",
+            "refreshed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        refreshed += 1
+
+    await asyncio.gather(*(_check(s) for s in shows))
+    await db.commit()
+    log.info(f"Show metadata refresher (TVDB): refreshed {refreshed}/{len(shows)} stale shows")
+
+
+async def _show_metadata_refresher():
+    """Keeps every TMDB-backed show's stored metadata (status plus the
+    tmdb_data snapshot: seasons, last/next_episode_to_air, refreshed_at) at
+    most ~a day old, so Next Up's missing-episode fallback
+    (routers/history.py's _next_up_needs_live_fetch) can answer "did a new
+    episode appear?" from the database alone instead of fan-out fetching
+    TMDB on every cold home-page load (#294, #307, #332).
+
+    This sweep is also what catches revivals: an unexpected renewal (e.g.
+    Futurama) flips a locally Ended/Canceled status back within a day. It
+    deliberately re-checks each show directly rather than using a
+    delta/changes feed - if this process happened to be down during the
+    window a changes feed would have caught a revival, that revival is gone
+    for good. A direct per-show check has no such window: whether
+    yesterday's sweep ran or not, today's checks every stale show from
+    scratch.
+
+    Runs shortly after startup (so fresh installs and restarts get their
+    snapshots gated quickly), then daily. Shows refreshed less than
+    STALE_AFTER ago are skipped, so a restart doesn't re-fetch what
+    yesterday's sweep already covered. TVDB-sourced snapshots
+    (tmdb_data.source == "tvdb") are never touched by the TMDB pass - their
+    season layout is TVDB-shaped (#335) - and are refreshed from TheTVDB by
+    _refresh_tvdb_shows instead.
+    """
+    import logging
+    from datetime import datetime, timedelta, timezone
+    log = logging.getLogger("uvicorn.error")
+
+    try:
+        from db import AsyncSessionLocal
+        from models.show import Show
+        from models.global_settings import GlobalSettings
+        from models.users import User, UserSettings
+        from core import tmdb as tmdb_client
+        from routers.media import check_tmdb_key
+        from routers.shows import apply_show_metadata
+    except Exception as e:
+        log.error(f"Show metadata refresher: failed to import dependencies: {e}")
+        return
+
+    FINAL_STATUSES = ("Ended", "Canceled")
+    STARTUP_DELAY = 2 * 60
+    SWEEP_INTERVAL = 24 * 60 * 60
+    # Skip shows whose snapshot is younger than this - comfortably less than
+    # SWEEP_INTERVAL so clock drift can't make the sweep skip everything, but
+    # large enough that a restart right after a sweep re-fetches ~nothing.
+    STALE_AFTER = timedelta(hours=20)
+    FETCH_CONCURRENCY = 10
+    log.info("Show metadata refresher: started")
+
+    def _snapshot_is_fresh(show) -> bool:
+        refreshed_at = (show.tmdb_data or {}).get("refreshed_at")
+        if not refreshed_at:
+            return False
+        try:
+            refreshed = datetime.fromisoformat(refreshed_at)
+        except (TypeError, ValueError):
+            return False
+        if refreshed.tzinfo is None:
+            refreshed = refreshed.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - refreshed < STALE_AFTER
+
+    delay = STARTUP_DELAY
+    while True:
+        await asyncio.sleep(delay)
+        delay = SWEEP_INTERVAL
+        # TVDB-sourced shows are swept separately (own key, own try) so a
+        # missing TMDB key below can't skip them, and vice versa.
+        try:
+            async with AsyncSessionLocal() as db:
+                await _refresh_tvdb_shows(db, log, _snapshot_is_fresh)
+        except Exception as e:
+            log.error(f"Show metadata refresher (TVDB): {e}")
+        try:
+            async with AsyncSessionLocal() as db:
+                # Show is a shared, instance-wide table with no single
+                # "current user" for this sweep to scope to, but a TMDB key
+                # isn't tied to whichever account configured it - any valid
+                # one fetches the same public show metadata. Global -> an
+                # admin's own key -> any user's, so installs that skip the
+                # global key still get the sweep instead of it silently
+                # never running, while preferring an admin's key over a
+                # random member's when both exist.
+                gs = (await db.execute(
+                    select(GlobalSettings).where(GlobalSettings.id == 1)
+                )).scalar_one_or_none()
+                api_key = gs.tmdb_api_key if gs else None
+                if not check_tmdb_key(api_key):
+                    api_key = (await db.execute(
+                        select(UserSettings.tmdb_api_key)
+                        .join(User, User.id == UserSettings.user_id)
+                        .where(UserSettings.tmdb_api_key.isnot(None), User.is_admin.is_(True))
+                        .limit(1)
+                    )).scalar_one_or_none()
+                if not check_tmdb_key(api_key):
+                    api_key = (await db.execute(
+                        select(UserSettings.tmdb_api_key)
+                        .where(UserSettings.tmdb_api_key.isnot(None))
+                        .limit(1)
+                    )).scalar_one_or_none()
+                if not check_tmdb_key(api_key):
+                    log.info("Show metadata refresher: no TMDB key configured anywhere, skipping")
+                    continue
+
+                all_shows = (await db.execute(
+                    select(Show).where(Show.tmdb_id.isnot(None))
+                )).scalars().all()
+                shows = [
+                    s for s in all_shows
+                    if (s.tmdb_data or {}).get("source") != "tvdb" and not _snapshot_is_fresh(s)
+                ]
+                if not shows:
+                    continue
+
+                sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+                refreshed = 0
+                revived = 0
+
+                async def _check(show):
+                    nonlocal refreshed, revived
+                    was_final = show.status in FINAL_STATUSES
+                    async with sem:
+                        try:
+                            # cache_ttl=None: a stale cached response would
+                            # defeat the point of this sweep.
+                            data = await tmdb_client.get_show(show.tmdb_id, api_key=api_key, cache_ttl=None)
+                        except Exception:
+                            return
+                    apply_show_metadata(show, data)
+                    refreshed += 1
+                    if was_final and data.get("status") not in FINAL_STATUSES:
+                        revived += 1
+
+                await asyncio.gather(*(_check(s) for s in shows))
+                await db.commit()
+                log.info(
+                    f"Show metadata refresher: refreshed {refreshed}/{len(shows)} stale shows, "
+                    f"{revived} revived"
+                )
+        except Exception as e:
+            log.error(f"Show metadata refresher: {e}")
+
+
+async def _simkl_token_refresher():
+    """Keeps Simkl AUTH V2 access tokens (7-day lifetime) fresh for every
+    other Simkl call site. Runs once at startup - which also recovers tokens
+    that expired while the server was down, the refresh token lasts 180 days -
+    then hourly. AUTH V1 connections have no refresh token and are skipped."""
+    import logging
+    log = logging.getLogger("uvicorn.error")
+
+    try:
+        from routers.simkl import refresh_expiring_simkl_tokens
+    except Exception as e:
+        log.error(f"Simkl token refresher: failed to import dependencies: {e}")
+        return
+
+    while True:
+        try:
+            refreshed = await refresh_expiring_simkl_tokens()
+            if refreshed:
+                log.info(f"Simkl token refresher: refreshed {refreshed} token(s)")
+        except Exception as e:
+            log.error(f"Simkl token refresher: {e}")
+        await asyncio.sleep(3600)
 
 
 async def _watchlist_poller():
@@ -405,7 +738,7 @@ async def _watchlist_poller():
                                     log.error(f"Watchlist: Sonarr error for tvdb:{tvdb_id}: {e}")
 
                         # Admin's own watchlist via REST (returns GUIDs directly)
-                        own_watchlist = await plex_client.get_watchlist(conn.token)
+                        own_watchlist = await plex_client.get_watchlist(conn.plex_account_token)
                         for item in own_watchlist:
                             item_type = item.get("type")
                             guids = plex_client.get_guids(item)
@@ -417,11 +750,11 @@ async def _watchlist_poller():
 
                         # Friends' watchlists via GraphQL (requires per-item enrichment for GUIDs)
                         if conn.watchlist_all_users:
-                            all_friends = await plex_client.get_all_friends(conn.token)
+                            all_friends = await plex_client.get_all_friends(conn.plex_account_token)
                             monitored = set(conn.watchlist_monitored_users or [])
                             friends = [f for f in all_friends if f["watchlist_id"] in monitored] if monitored else []
                             for friend in friends:
-                                friend_items = await plex_client.get_friend_watchlist(conn.token, friend["watchlist_id"])
+                                friend_items = await plex_client.get_friend_watchlist(conn.plex_account_token, friend["watchlist_id"])
                                 for fi in friend_items:
                                     plex_id = fi.get("id")
                                     if not plex_id:
@@ -429,7 +762,7 @@ async def _watchlist_poller():
                                     cache_key = f"plex:{plex_id}"
                                     if cache_key in synced or cache_key in newly_synced:
                                         continue
-                                    enriched = await plex_client.enrich_plex_item(conn.token, plex_id)
+                                    enriched = await plex_client.enrich_plex_item(conn.plex_account_token, plex_id)
                                     if not enriched:
                                         continue
                                     item_type = fi.get("type", "").lower()
@@ -449,24 +782,8 @@ async def _watchlist_poller():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Ensure all Bingebase columns exist on existing databases
-        for col_def in [
-            "bingebase_webhook_url VARCHAR(500)",
-            "bingebase_api_key VARCHAR(255)",
-            "bingebase_sync_watched BOOLEAN DEFAULT TRUE",
-            "bingebase_scrobble BOOLEAN DEFAULT TRUE",
-            "bingebase_push_watched BOOLEAN DEFAULT FALSE",
-            "bingebase_push_ratings BOOLEAN DEFAULT FALSE",
-            "bingebase_auto_sync_interval FLOAT",
-            "bingebase_auto_push_interval FLOAT",
-        ]:
-            try:
-                await conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS {col_def}"))
-            except Exception:
-                pass
 
     # Clean up stuck sync jobs and orphaned playback sessions on startup
     from db import async_sessionmaker
@@ -479,16 +796,32 @@ async def lifespan(app: FastAPI):
         )
         await db.execute(delete(PlaybackSession))
         await db.commit()
+        try:
+            await prune_old_sync_jobs(db)
+        except Exception:
+            await db.rollback()
 
+    tmdb.init_client()
     scheduler_task = asyncio.create_task(_auto_sync_scheduler())
     watchlist_task = asyncio.create_task(_watchlist_poller())
     manual_session_task = asyncio.create_task(_manual_session_completer())
+    emby_progress_task = asyncio.create_task(_emby_progress_poller())
+    show_metadata_task = asyncio.create_task(_show_metadata_refresher())
+    simkl_token_task = asyncio.create_task(_simkl_token_refresher())
 
     yield
+
+    simkl_token_task.cancel()
+    try:
+        await simkl_token_task
+    except asyncio.CancelledError:
+        pass
 
     scheduler_task.cancel()
     watchlist_task.cancel()
     manual_session_task.cancel()
+    emby_progress_task.cancel()
+    show_metadata_task.cancel()
     try:
         await scheduler_task
     except asyncio.CancelledError:
@@ -501,8 +834,18 @@ async def lifespan(app: FastAPI):
         await manual_session_task
     except asyncio.CancelledError:
         pass
+    try:
+        await emby_progress_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await show_metadata_task
+    except asyncio.CancelledError:
+        pass
+    await tmdb.close_client()
 
 from core.config import settings
+from core.timeutil import utcnow
 
 # Rate limiter — keyed by client IP, in-memory storage (suitable for single-instance deploy).
 # API docs (docs_url/redoc_url/openapi_url) are disabled here and re-added below behind
@@ -551,11 +894,15 @@ app.include_router(lists.router, prefix="/lists", tags=["lists"])
 app.include_router(profile.router, prefix="/profile", tags=["profile"])
 app.include_router(trakt.router, prefix="/trakt", tags=["trakt"])
 app.include_router(simkl.router, prefix="/simkl", tags=["simkl"])
+app.include_router(wetrakr.router, prefix="/wetrakr", tags=["wetrakr"])
 app.include_router(mdblist.router, prefix="/mdblist", tags=["mdblist"])
 app.include_router(bingebase.router, prefix="/bingebase", tags=["bingebase"])
 app.include_router(comments.router, prefix="/comments", tags=["comments"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(export.router, prefix="/export", tags=["export"])
+app.include_router(yamtrack.router, prefix="/yamtrack", tags=["yamtrack"])
+app.include_router(calendar.router, prefix="/calendar", tags=["calendar"])
+app.include_router(saved_filters.router, prefix="/saved-filters", tags=["saved-filters"])
 app.include_router(compat.router, tags=["compat"])
 
 @app.get("/health")
