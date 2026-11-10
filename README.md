@@ -1,10 +1,32 @@
-> **Fork maintenu : [Scrob officiel](https://github.com/ellite/scrob)** — version officielle suivie dans [`UPSTREAM_VERSION`](UPSTREAM_VERSION).
->
-> ARVIO est désormais inclus dans l’officiel. Ce fork conserve surtout l’envoi automatique de l’historique vers Bingebase, son intervalle configurable et le suivi des envois échoués. Bingebase reste une intégration à sens unique, de Scrob vers Bingebase.
->
-> La synchronisation quotidienne intègre la branche officielle, exécute les tests et les contrôles d’image, puis fusionne une PR et publie l’image si tout réussit. En cas de conflit ou de test en échec, la version publiée reste inchangée. Les bases de l’ancien fork ARVIO sont mises à niveau sans réinitialisation ; sauvegardez PostgreSQL avant toute mise à jour.
->
-> **Maintained fork:** upstream version recorded in `UPSTREAM_VERSION`, with scheduled Bingebase history pushes and delivery failure accounting. Daily upstream updates are tested before merge/publication; failures leave the published version unchanged. Legacy ARVIO databases are upgraded without resetting migration history. Back up PostgreSQL before upgrading.
+# Scrob ARVIO — apports du fork / fork additions
+
+## Français
+
+Ce fork suit [Scrob officiel](https://github.com/ellite/scrob) et y ajoute :
+
+- **Historique Bingebase automatique** : envoi périodique avec un intervalle configurable, notamment toutes les heures.
+- **Suivi des envois Bingebase** : comptage des réussites et des échecs ; envoi manuel de l’historique possible même lorsque le scrobbling en direct est désactivé.
+- **Mises à jour officielles automatiques** : vérification quotidienne, tests avant fusion et publication Docker. Un conflit ou un contrôle en échec bloque la publication.
+- **Migration des anciennes installations du fork** : conservation des données et de l’historique des migrations, sans réinitialisation.
+
+**ARVIO est désormais intégré à Scrob officiel** : ce n’est plus une exclusivité de ce fork. Bingebase fonctionne dans le sens **Scrob → Bingebase**.
+
+Image Docker du fork : `ghcr.io/aerya/scrob-arvio:latest`. Version officielle suivie : [`UPSTREAM_VERSION`](UPSTREAM_VERSION). Sauvegardez PostgreSQL avant une mise à jour.
+
+## English
+
+This fork tracks [upstream Scrob](https://github.com/ellite/scrob) and adds:
+
+- **Scheduled Bingebase history pushes** with a configurable interval, including hourly updates.
+- **Bingebase delivery tracking** with success and failure counts; manual history pushes remain available even when live scrobbling is disabled.
+- **Automatic upstream updates**: daily checks, tests before merging, and Docker publication. Conflicts or failed checks block publication.
+- **Legacy fork upgrades** that preserve existing data and migration history without a reset.
+
+**ARVIO is now included in upstream Scrob** and is no longer exclusive to this fork. Bingebase synchronization is **Scrob → Bingebase** only.
+
+Fork Docker image: `ghcr.io/aerya/scrob-arvio:latest`. Tracked upstream version: [`UPSTREAM_VERSION`](UPSTREAM_VERSION). Back up PostgreSQL before upgrading.
+
+---
 
 <div align="center">
   <img src="frontend/public/scrob.png" alt="Scrob Logo" width="120" />
