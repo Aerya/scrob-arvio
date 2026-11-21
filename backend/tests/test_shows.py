@@ -76,6 +76,57 @@ class FindLocalShowForTvdbTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(show.title, "Cross-linked")
 
 
+class ResolveTvdbShowTests(FindLocalShowForTvdbTests):
+    """#585: TVDB cross-links a TMDB id whose entry was deleted. TMDB answers
+    404, which used to bubble up as a 500 on the TVDB show/season/episode page."""
+
+    SHOW_DATA = {"title": "Gone From TMDB", "overview": "o", "seasons": [], "genres": []}
+
+    @staticmethod
+    def _http_error(status):
+        import httpx
+
+        req = httpx.Request("GET", "https://api.themoviedb.org/3/tv/1")
+        return httpx.HTTPStatusError("err", request=req, response=httpx.Response(status, request=req))
+
+    async def test_dead_tmdb_entry_falls_back_to_tvdb_only_show(self):
+        with patch("routers.webhooks._find_or_create_show", AsyncMock(side_effect=self._http_error(404))):
+            async with self.Session() as db:
+                show, tmdb_id = await shows._resolve_tvdb_show(db, 4242, self.SHOW_DATA, 999, "key")
+                self.assertIsNone(tmdb_id)
+                self.assertIsNone(show.tmdb_id)
+                self.assertEqual(show.tvdb_id, 4242)
+                self.assertEqual(show.canonical_source, "tvdb")
+                self.assertEqual(show.title, "Gone From TMDB")
+
+    async def test_other_tmdb_http_errors_still_surface(self):
+        import httpx
+
+        with patch("routers.webhooks._find_or_create_show", AsyncMock(side_effect=self._http_error(401))):
+            async with self.Session() as db:
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await shows._resolve_tvdb_show(db, 4242, self.SHOW_DATA, 999, "key")
+
+    async def test_live_tmdb_entry_is_used_unchanged(self):
+        sentinel = SimpleNamespace(tmdb_id=999)
+        with patch("routers.webhooks._find_or_create_show", AsyncMock(return_value=sentinel)):
+            async with self.Session() as db:
+                show, tmdb_id = await shows._resolve_tvdb_show(db, 4242, self.SHOW_DATA, 999, "key")
+                self.assertIs(show, sentinel)
+                self.assertEqual(tmdb_id, 999)
+
+    async def test_existing_local_show_is_reused_without_asking_tmdb(self):
+        from models.show import Show
+
+        with patch("routers.webhooks._find_or_create_show", AsyncMock(side_effect=AssertionError("no TMDB call"))):
+            async with self.Session() as db:
+                db.add(Show(title="Local", tvdb_id=4242, tmdb_id=None))
+                await db.commit()
+                show, tmdb_id = await shows._resolve_tvdb_show(db, 4242, self.SHOW_DATA, 999, "key")
+                self.assertEqual(show.title, "Local")
+                self.assertEqual(tmdb_id, 999)
+
+
 class _Scalars:
     def __init__(self, item=None):
         self.item = item
@@ -193,7 +244,7 @@ class RefreshShowMetadataTvdbFallbackCorruptionTests(unittest.IsolatedAsyncioTes
     silently overwrite an already-correct, TMDB-sourced episode."""
 
     def _show(self):
-        return SimpleNamespace(id=1, tmdb_id=980001, tvdb_id=980002, title="Show")
+        return SimpleNamespace(id=1, tmdb_id=980001, tvdb_id=980002, title="Show", canonical_source="tmdb")
 
     def _tmdb_show_data(self):
         return {"name": "Show", "seasons": [{"season_number": 1, "episode_count": 10, "name": "Season 1"}]}
@@ -360,3 +411,68 @@ class TvdbSeasonArtTests(unittest.IsolatedAsyncioTestCase):
         }])
         # An episode that was only showing the show poster now shows its season's.
         self.assertEqual(payload["seasons"]["season_1"][0]["poster_path"], "https://artworks.thetvdb.com/banners/s1.jpg")
+
+
+class SeasonNavigationOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_season_detail_uses_display_seasons_for_navigation(self):
+        show = SimpleNamespace(id=1, tmdb_id=312415, tvdb_id=369316)
+        db = AsyncMock()
+        empty = MagicMock()
+        empty.scalars.return_value.all.return_value = []
+        empty.all.return_value = []
+        empty.scalar_one_or_none.return_value = None
+        found = MagicMock()
+        found.scalar_one_or_none.return_value = show
+        db.execute.side_effect = [found] + [empty] * 20
+        positions = {
+            (1, 1): SimpleNamespace(display_season=6, display_episode=1),
+            (2, 1): SimpleNamespace(display_season=7, display_episode=1),
+        }
+        with (
+            patch.object(shows, 'get_episode_order', AsyncMock(return_value=SimpleNamespace(episode_order='tvdb:official', tvdb_id=369316))),
+            patch.object(shows, 'get_user_tmdb_key', AsyncMock(return_value='key')),
+            patch.object(shows, 'get_user_metadata_language', AsyncMock(return_value='en')),
+            patch.object(shows, 'check_tmdb_key', return_value=True),
+            patch.object(shows, '_tvdb_season_art', AsyncMock(return_value={6: {'name': 'Series F'}})),
+            patch.object(shows, '_resolve_ordered_season', AsyncMock(return_value=({'episodes': []}, set()))),
+            patch.object(shows, 'get_position_maps', AsyncMock(return_value=(positions, {}))),
+            patch.object(shows, 'format_show', return_value={'seasons_meta': [{'season_number': 1}, {'season_number': 2}]}),
+            patch.object(shows, 'get_watch_stats', AsyncMock(return_value=SimpleNamespace(plays=0, watch_time_minutes=0, last_watched_at=None))),
+            patch.object(shows, 'enrich_with_state', AsyncMock()),
+        ):
+            payload = await shows.get_show_season(312415, 6, db, SimpleNamespace(id=7))
+        self.assertEqual([s['season_number'] for s in payload['show']['seasons_meta']], [6, 7])
+        self.assertEqual(payload['show']['seasons_meta'][0]['name'], 'Series F')
+
+    async def test_nonlocal_season_uses_ordered_payload_and_navigation(self):
+        db = AsyncMock()
+        empty = MagicMock()
+        empty.scalars.return_value.all.return_value = []
+        empty.all.return_value = []
+        empty.scalar_one_or_none.return_value = None
+        found = MagicMock()
+        found.scalar_one_or_none.return_value = None
+        db.execute.side_effect = [found] + [empty] * 20
+        positions = {
+            (1, 1): SimpleNamespace(display_season=6, display_episode=1),
+            (2, 1): SimpleNamespace(display_season=7, display_episode=1),
+        }
+        with (
+            patch.object(shows, 'get_episode_order', AsyncMock(return_value=SimpleNamespace(episode_order='tvdb:official', tvdb_id=None))),
+            patch.object(shows, 'get_user_tmdb_key', AsyncMock(return_value='key')),
+            patch.object(shows, 'get_user_metadata_language', AsyncMock(return_value='en')),
+            patch.object(shows, 'check_tmdb_key', return_value=True),
+            patch.object(shows, '_tvdb_season_art', AsyncMock(return_value={6: {'name': 'Series F'}})) as season_art,
+            patch.object(shows, '_resolve_ordered_season', AsyncMock(return_value=({'name': 'Series F', 'episodes': []}, set()))),
+            patch.object(shows, 'get_position_maps', AsyncMock(return_value=(positions, {}))),
+            patch.object(shows.tmdb, 'get_show', AsyncMock(return_value={'name': 'QI XL', 'external_ids': {'tvdb_id': 369316}})),
+            patch.object(shows.tmdb, 'get_season', AsyncMock(side_effect=AssertionError('must not fetch canonical display season'))),
+            patch.object(shows, 'get_watch_stats', AsyncMock(return_value=SimpleNamespace(plays=0, watch_time_minutes=0, last_watched_at=None))),
+            patch.object(shows, 'enrich_with_state', AsyncMock()),
+        ):
+            payload = await shows.get_show_season(312415, 6, db, SimpleNamespace(id=7))
+        self.assertEqual([s['season_number'] for s in payload['show']['seasons_meta']], [6, 7])
+        self.assertEqual(payload['show']['seasons_meta'][0]['name'], 'Series F')
+        self.assertIsNone(payload['show']['id'])
+        self.assertEqual(payload['name'], 'Series F')
+        season_art.assert_awaited_once_with(db, 7, 'tvdb:official', 369316)

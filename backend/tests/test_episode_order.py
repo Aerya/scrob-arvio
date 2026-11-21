@@ -1309,6 +1309,51 @@ class BuildOrderPositionsTests(_PositionsDB):
             batched = await _eo.get_positions_for_series(db, [(555, "tmdb:group:xyz")])
             self.assertEqual(batched[(555, "tmdb:group:xyz")][(1, 1)].display_season, 1)
 
+    async def test_forced_tvdb_rebuild_refreshes_stale_bridge(self) -> None:
+        # Live #577 data: TMDB S5E16 and TVDB S10E16 have no external-id
+        # link and disagree by 18 days. Existing positions/bridge omit E16.
+        async with self.Session() as db:
+            show = ShowModel(tmdb_id=312415, tvdb_id=369316, title="QI XL")
+            db.add(show)
+            db.add(EpisodeOrderMapping(
+                series_tmdb_id=312415, tmdb_season_number=5, tmdb_episode_number=15,
+                tmdb_episode_id=8108487, tvdb_id=7646416,
+                tvdb_season_number=10, tvdb_episode_number=15, match_method="title_date",
+            ))
+            db.add(_eo.ShowEpisodePosition(
+                series_tmdb_id=312415, order_key="tvdb:official",
+                display_season=10, display_episode=15, tmdb_episode_id=8108487,
+                tmdb_season_number=5, tmdb_episode_number=15,
+            ))
+            await db.commit()
+            canonical = [dict(id=7573146, season_number=5, episode_number=16,
+                              name="Just the Job", air_date="2013-08-31")]
+            alternate = [dict(id=7646417, seasonNumber=10, number=16,
+                              name="Just the Job", aired="2013-08-13")]
+            progress = AsyncMock()
+            with (
+                patch.object(_eo, "_get_tvdb_id_for_show", AsyncMock(return_value=(369316, {}))),
+                patch.object(_eo, "_fetch_show_episodes", AsyncMock(return_value=(canonical, alternate))) as fetch,
+                patch.object(_tmdb, "get_episode_external_ids", AsyncMock(return_value={})),
+            ):
+                cached = await _eo.build_order_positions(
+                    db, 312415, "tvdb:official", show=show,
+                    tmdb_api_key="k", tvdb_api_key="t",
+                )
+                self.assertTrue(cached["cached"])
+                fetch.assert_not_awaited()
+                await _eo.build_order_positions(
+                    db, 312415, "tvdb:official", show=show,
+                    tmdb_api_key="k", tvdb_api_key="t", force=True, on_progress=progress,
+                )
+                self.assertIsNone(fetch.call_args.args[-1])
+                progress.assert_awaited()
+            await db.commit()
+            self.assertEqual(
+                await _eo.resolve_display_to_canonical(db, 312415, "tvdb:official", 10, 16),
+                (5, 16),
+            )
+
     async def test_rebuild_is_skipped_without_force(self) -> None:
         payload = {"groups": [{"order": 0, "episodes": [
             {"id": 1, "season_number": 1, "episode_number": 1, "order": 0},
@@ -1803,3 +1848,27 @@ class ApplyDefaultEpisodeOrderEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BroadcastDateDriftTests(unittest.IsolatedAsyncioTestCase):
+    async def test_distinctive_title_matches_across_broadcast_drift_and_probe(self):
+        # More than ten episodes also exercises the preflight sample.
+        titles = [f'Distinctive topic {i}' for i in range(15)] + ['Just the Job']
+        canonical = [dict(id=i, season_number=5, episode_number=i, name=t, air_date='2013-08-13') for i, t in enumerate(titles, 1)]
+        alternate = [dict(id=i+100, seasonNumber=10, number=i, name=t, aired='2013-08-31') for i, t in enumerate(titles, 1)]
+        with patch('core.episode_order.tmdb.get_episode_external_ids', AsyncMock(return_value={})):
+            mappings = await _match_tmdb_to_tvdb_episodes(canonical, alternate, 312415, 'key')
+        self.assertEqual(len(mappings), 16)
+        self.assertEqual({m.tvdb_season_number for m in mappings}, {10})
+
+    async def test_duplicate_titles_are_ambiguous_across_date_drift(self):
+        canonical = [dict(id=1, season_number=1, episode_number=1, name='Just the Job', air_date='2013-08-13')]
+        alternate = [dict(id=i, seasonNumber=10, number=i, name='Just the Job', aired='2013-08-31') for i in (1, 2)]
+        with patch('core.episode_order.tmdb.get_episode_external_ids', AsyncMock(return_value={})):
+            mappings = await _match_tmdb_to_tvdb_episodes(canonical, alternate, 312415, 'key')
+        self.assertEqual(mappings, [])
+
+    def test_generic_titles_keep_strict_date_guard(self):
+        for title in ('Episode 16', 'Part IV', 'Pilot', 'Special'):
+            with self.subTest(title=title):
+                self.assertFalse(_titles_match(_normalise_title(title), _normalise_title(title), 18))

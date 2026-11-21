@@ -33,6 +33,7 @@ from core.jellyfin import get_jellyfin_tmdb_id
 import core.trakt as trakt_client
 from core.enrichment import enrich_media, is_unmapped_tvdb_episode, create_media_safely, enrich_media_safely, apply_media_change_safely, enrich_episode_from_tvdb
 from core.identity import coerce_id, link_show_ids
+from core.episode_order import to_simkl_positions
 from core.episode_order import (
     ensure_episode_order_mapping,
     load_tvdb_episode_id_positions,
@@ -515,9 +516,14 @@ async def batch_enrich_items(
     api_key: str = None,
     show_title_map: dict[int, str] | None = None,
     user_id: int | None = None,
+    prune_absent: bool = False,
 ) -> list[dict]:
     """
     Parallel enrichment for newly created media.
+    With prune_absent (non-collection syncs, e.g. Nuvio watched/progress): an
+    episode TMDB confirms doesn't exist on a TMDB-canonical show in the user's
+    TMDB aired order gets no TVDB fallback and its unreferenced stub is deleted
+    rather than left as a ghost row (#581).
     Episodes: one TMDB /season/{n} call per unique season (3865 calls vs 45k).
     Movies: parallel /movie/{id} calls.
     Returns a list of warning dicts for seasons/items that couldn't be enriched.
@@ -618,6 +624,20 @@ async def batch_enrich_items(
     async def apply_tvdb_ep_data(media: Media, raw_ep: dict) -> None:
         await enrich_episode_from_tvdb(media, tvdb_client.format_episode(raw_ep))
 
+    prune_stids: set[int] = set()
+    if prune_absent and user_id:
+        from core.episode_order import resolve_order_key, is_aired_order
+        canon_res = await db.execute(
+            select(Show.tmdb_id).where(
+                Show.tmdb_id.in_({stid for (stid, _) in season_to_eps}),
+                Show.canonical_source != "tvdb",
+            )
+        )
+        for (stid,) in canon_res.all():
+            if is_aired_order(await resolve_order_key(db, user_id, stid)):
+                prune_stids.add(stid)
+
+    ghost_stubs: list[Media] = []
     tvdb_resolved_season_keys: set[tuple] = set()
     for (stid, sn), ep_list in season_to_eps.items():
         ep_map = season_data.get((stid, sn), {})
@@ -627,12 +647,33 @@ async def batch_enrich_items(
             if ep:
                 await apply_media_change_safely(db, media, lambda media=media, ep=ep: apply_ep_data(media, ep))
                 continue
+            if (
+                stid in prune_stids
+                and (stid, sn) not in failed_season_keys
+                and media.tmdb_id is None
+            ):
+                mapped = await db.scalar(
+                    select(EpisodeOrderMapping.id).where(
+                        EpisodeOrderMapping.series_tmdb_id == stid,
+                        EpisodeOrderMapping.tvdb_season_number == sn,
+                        EpisodeOrderMapping.tvdb_episode_number == media.episode_number,
+                    ).limit(1)
+                )
+                if mapped is None:
+                    ghost_stubs.append(media)
+                    continue
             tvdb_ep = tvdb_ep_map.get(media.episode_number)
             if tvdb_ep:
                 await apply_media_change_safely(
                     db, media, lambda media=media, tvdb_ep=tvdb_ep: apply_tvdb_ep_data(media, tvdb_ep)
                 )
                 tvdb_resolved_season_keys.add((stid, sn))
+
+    if ghost_stubs:
+        from core.enrichment import unreferenced_media_ids
+        stub_ids = await unreferenced_media_ids(db, [m.id for m in ghost_stubs])
+        if stub_ids:
+            await db.execute(delete(Media).where(Media.id.in_(stub_ids)))
 
     # Build per-season warning entries (one entry per still-failed season) -
     # a season fully recovered via TVDB doesn't need to warn the user.
@@ -1632,12 +1673,13 @@ async def _fan_out_changes_to_other_connections(
 
         if push_simkl_watched and new_watched_ids:
             simkl_watched_at_by_media = await _latest_watched_at(db, user_id, list(new_watched_ids))
+            simkl_episode_pushes: list[tuple[int, int, int, datetime]] = []
             for mid in new_watched_ids:
                 media = media_by_id.get(mid)
                 if not media or not media.tmdb_id:
                     continue
                 # Simkl has no unknown-date representation, and watched_at=None means
-                # "stamp as now" on its side — skip rather than fabricate a date.
+                # "stamp as now" on its side - skip rather than fabricate a date.
                 watched_at = simkl_watched_at_by_media.get(mid)
                 if watched_at is None:
                     continue
@@ -1650,12 +1692,19 @@ async def _fan_out_changes_to_other_connections(
                 elif media.media_type == MediaType.episode and media.show_id and media.season_number is not None and media.episode_number is not None:
                     show = shows_by_id.get(media.show_id)
                     if show and show.tmdb_id:
-                        push_tasks.append(
-                            simkl_client.add_episode_to_history(
-                                settings.simkl_client_id, settings.simkl_access_token,
-                                show.tmdb_id, media.season_number, media.episode_number, watched_at,
-                            )
-                        )
+                        simkl_episode_pushes.append((show.tmdb_id, media.season_number, media.episode_number, watched_at))
+            # Simkl indexes episodes by TVDB's layout, so send the TVDB
+            # coordinates Scrob has mapped (#453), looked up in one batch.
+            simkl_positions = await to_simkl_positions(
+                db, [(show_id, season, episode) for show_id, season, episode, _ in simkl_episode_pushes]
+            )
+            for (show_id, season, episode), (_, _, _, watched_at) in zip(simkl_positions, simkl_episode_pushes):
+                push_tasks.append(
+                    simkl_client.add_episode_to_history(
+                        settings.simkl_client_id, settings.simkl_access_token,
+                        show_id, season, episode, watched_at,
+                    )
+                )
 
         # Simkl has no "rated but not watched" state: rating an item that isn't
         # already in one of its lists auto-files it as watched (today's date), and
@@ -2809,7 +2858,8 @@ async def sync_items(
                             series_title_map[series_tmdb_id] = title
 
         warnings = await batch_enrich_items(
-            db, new_media_for_enrichment, api_key=api_key, show_title_map=series_title_map, user_id=user_id
+            db, new_media_for_enrichment, api_key=api_key, show_title_map=series_title_map, user_id=user_id,
+            prune_absent=(not sync_collection and source == CollectionSource.nuvio),
         )
         await db.commit()
 
@@ -4754,6 +4804,59 @@ async def _apply_nuvio_progress(
     await db.commit()
 
 
+# A resume position stamped within this long before a completed watch is the
+# tail of the same viewing (a client reporting its final position as it
+# finishes), not a new partial rewatch.
+_OBSOLETE_PROGRESS_GRACE = timedelta(minutes=5)
+
+
+async def _prune_obsolete_progress(db: AsyncSession, user_id: int) -> int:
+    """Drop resume positions that a later completed watch has superseded (#584).
+
+    Nuvio/Stremio imports record an episode's intermediate position while it is
+    playing and its completed watch later, so Continue Watching kept showing
+    the finished episode at its old percentage. A position is obsolete when the
+    newest completed watch of the same item is not older than it. A position
+    stamped after the last completion is a genuine rewatch in progress and is
+    kept. Compared against watch events rather than the Nuvio response so it
+    holds for already-known events and when playback-progress sync is off."""
+    progress_rows = (
+        await db.execute(
+            select(PlaybackProgress.id, PlaybackProgress.media_id, PlaybackProgress.updated_at).where(
+                PlaybackProgress.user_id == user_id
+            )
+        )
+    ).all()
+    if not progress_rows:
+        return 0
+    media_ids = list({media_id for _, media_id, _ in progress_rows})
+    latest_watch: dict[int, datetime] = {}
+    for i in range(0, len(media_ids), _MAX_IN_PARAMS):
+        result = await db.execute(
+            select(WatchEvent.media_id, func.max(WatchEvent.watched_at))
+            .where(
+                WatchEvent.user_id == user_id,
+                WatchEvent.completed.is_(True),
+                WatchEvent.watched_at.isnot(None),
+                WatchEvent.media_id.in_(media_ids[i : i + _MAX_IN_PARAMS]),
+            )
+            .group_by(WatchEvent.media_id)
+        )
+        latest_watch.update({media_id: watched_at for media_id, watched_at in result.all()})
+    obsolete_ids = [
+        progress_id
+        for progress_id, media_id, updated_at in progress_rows
+        if updated_at is not None
+        and media_id in latest_watch
+        and updated_at <= latest_watch[media_id] + _OBSOLETE_PROGRESS_GRACE
+    ]
+    for i in range(0, len(obsolete_ids), _MAX_IN_PARAMS):
+        await db.execute(delete(PlaybackProgress).where(PlaybackProgress.id.in_(obsolete_ids[i : i + _MAX_IN_PARAMS])))
+    if obsolete_ids:
+        await db.commit()
+    return len(obsolete_ids)
+
+
 async def run_nuvio_sync(
     user_id: int,
     job_id: int,
@@ -5001,6 +5104,7 @@ async def _run_nuvio_sync(
 
             if progress_records:
                 await _apply_nuvio_progress(db, user_id, progress_records, show_map, tmdb_ids)
+            await _prune_obsolete_progress(db, user_id)
 
             # A pull only populates scrob's own data — it never automatically pushes to
             # other connections; users push explicitly per-service (the "Push" buttons).
@@ -5598,6 +5702,7 @@ async def _run_stremio_sync(
                 )
             if progress_records:
                 await _apply_nuvio_progress(db, user_id, progress_records, show_map, tmdb_ids)
+            await _prune_obsolete_progress(db, user_id)
 
             complete_snapshot_ids = (
                 {str(record["content_id"]) for record in library_records}
