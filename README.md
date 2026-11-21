@@ -112,7 +112,7 @@ Scrob syncs your libraries from **Jellyfin**, **Plex**, **Emby**, **Nuvio**, **A
 - **Continue Watching & Next Up**: Dashboard cards showing in-progress items and the next episode to watch in each series.
 - **Statistics**: A per-user stats page - watch time, activity charts, ratings breakdown, and most-watched people/networks - filterable by all-time, year, month, week, or a custom period.
 - **Season & episode tracking**: Detailed season views with per-episode watched state and progress.
-- **Episode ordering**: Watch a show in an alternate episode order - DVD, absolute, alternate or regional order from TheTVDB, or any TMDB episode group (story arc, production, digital). Chosen per show from the **Episode order** control on the show page; every surface the show's episodes appear on - show, season and episode pages, Next Up, Now Playing, the calendar, history and cards - renumbers to match. TheTVDB-sourced orders need a TheTVDB key; TMDB episode groups don't.
+- **Episode ordering**: Watch a show in an alternate episode order - DVD, absolute, alternate or regional order from TheTVDB, or any TMDB episode group (story arc, production, digital). Chosen per show from the **Episode order** control on the show page; every surface the show's episodes appear on - show, season and episode pages, Next Up, Now Playing, the calendar, history and cards - renumbers to match. Season navigation follows the selected order, including shows outside the local library and shows whose first display season is greater than 1. Unique distinctive episode titles can match across different TMDB and TVDB broadcast dates. Forcing an episode-order refresh rebuilds both the TMDB–TVDB mapping and the selected order’s display positions. TheTVDB-sourced orders need a TheTVDB key; TMDB episode groups don't.
 - **Cast & crew pages**: Full filmography for any person, linked to your library.
 - **Radarr & Sonarr integration**: Add movies and shows to Radarr/Sonarr directly from the Scrob UI.
 - **Plex watchlist automation**: Automatically send items from your Plex watchlist (and selected friends' watchlists) to Radarr or Sonarr.
@@ -351,6 +351,27 @@ environment:
 ```
 
 See `docker-compose.yaml` for the full list of OIDC variables and other variables.
+
+### Docker secrets
+
+Any setting can be read from a file instead of an environment variable by adding the `_FILE` suffix to its name, which is how Docker Compose secrets are mounted under `/run/secrets`. This works for every variable in the table above, including `SECRET_KEY`, `POSTGRES_PASSWORD`, `SMTP_PASSWORD` and `OIDC_CLIENT_SECRET`. If both `NAME` and `NAME_FILE` are set, `NAME` wins. A trailing newline in the file is ignored, and Scrob refuses to start if a `_FILE` path cannot be read.
+
+```yaml
+services:
+  scrob:
+    environment:
+      SECRET_KEY_FILE: /run/secrets/scrob_secret_key
+      POSTGRES_PASSWORD_FILE: /run/secrets/scrob_db_password
+    secrets:
+      - scrob_secret_key
+      - scrob_db_password
+
+secrets:
+  scrob_secret_key:
+    file: ./secrets/scrob_secret_key.txt
+  scrob_db_password:
+    file: ./secrets/scrob_db_password.txt
+```
 
 ### Reverse proxy
 

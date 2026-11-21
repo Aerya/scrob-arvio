@@ -53,14 +53,17 @@ def _titles_match(tmdb_title: str, tvdb_title: str, air_date_distance: int | Non
     """Whether a TMDB and a TVDB episode title (both already normalised) name
     the same episode, given how far apart their air dates are.
 
-    Equal titles within a day of each other have always matched (a missing date
-    counts as no disagreement). TVDB also often prefixes the series name onto a
-    special ("Kimagure Orange Road: White Lovers" against TMDB's "White
-    Lovers"), so one title that is the other with a prefix in front matches
-    too - but only when both dates are known and within a day, since a
-    title-suffix match alone is much weaker than an equal title (#351)."""
+    Distinctive equal titles can bridge broadcast-date drift; the caller
+    accepts only a single candidate. Generic titles and suffix matches still
+    need the existing date guard to avoid confusing unrelated episodes.
+    """
     if not tmdb_title or not tvdb_title:
         return False
+    generic = tmdb_title in {"pilot", "special", "specials", "episode", "part"} or bool(
+        re.fullmatch(r"(?:episode|ep|part|chapter|special)(?:[0-9]+|[ivxlcdm]+)", tmdb_title)
+    )
+    if tmdb_title == tvdb_title and not generic:
+        return True
     if air_date_distance is not None and air_date_distance > 1:
         return False
     if tmdb_title == tvdb_title:
@@ -328,9 +331,14 @@ async def _order_positions_from_tmdb_group(
 async def _order_positions_from_tvdb_type(
     db: AsyncSession, series_tmdb_id: int, order_key: str, show_tvdb_id: int,
     tmdb_api_key: str, tvdb_api_key: str, cache_ttl: float | None,
+    *, force: bool = False,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> list[ShowEpisodePosition]:
     # Every tvdb:* order needs the tvdb-episode-id <-> canonical bridge.
-    await ensure_episode_order_mapping(db, series_tmdb_id, tmdb_api_key, tvdb_api_key)
+    await ensure_episode_order_mapping(
+        db, series_tmdb_id, tmdb_api_key, tvdb_api_key,
+        force=force, on_progress=on_progress,
+    )
     bridge = {
         m.tvdb_id: m
         for m in (await db.execute(
@@ -452,7 +460,8 @@ async def build_order_positions(
                 with db.no_autoflush:
                     await link_show_ids(db, show, tvdb_id=show_tvdb_id)
         rows = await _order_positions_from_tvdb_type(
-            db, series_tmdb_id, key, show_tvdb_id, tmdb_api_key, tvdb_api_key, cache_ttl
+            db, series_tmdb_id, key, show_tvdb_id, tmdb_api_key, tvdb_api_key, cache_ttl,
+            force=force, on_progress=on_progress,
         )
     else:
         raise ValueError(f"Unsupported episode order: {order_key}")
@@ -679,6 +688,32 @@ async def get_tmdb_to_tvdb_positions(
     }
 
 
+async def to_simkl_positions(
+    db: AsyncSession,
+    positions: list[tuple[int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """Translate (show_tmdb_id, season, episode) triples, which are TMDB
+    coordinates, into the TVDB ones Simkl indexes episodes by (#453).
+
+    Simkl resolves a show's episodes through TVDB's season layout, so an
+    episode TMDB numbers S2E91 is S2E33 to it and the TMDB coordinates are
+    rejected as not found. Scrob already stores that TMDB -> TVDB mapping for
+    shows whose episodes it has matched; an episode with no stored mapping is
+    returned unchanged, so shows where the two providers agree (or that were
+    never mapped) behave exactly as before. Output has the same length and
+    order as the input."""
+    if not positions:
+        return []
+    by_key = await get_tmdb_to_tvdb_positions(db, sorted({show_id for show_id, _, _ in positions}))
+    translated: list[tuple[int, int, int]] = []
+    for show_id, season, episode in positions:
+        mapping = by_key.get((show_id, season, episode))
+        translated.append(
+            (show_id, mapping.tvdb_season_number, mapping.tvdb_episode_number) if mapping else (show_id, season, episode)
+        )
+    return translated
+
+
 async def _match_tmdb_to_tvdb_episodes(
     tmdb_episodes: list[dict],
     tvdb_episodes: list[dict],
@@ -689,7 +724,7 @@ async def _match_tmdb_to_tvdb_episodes(
     on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> list[EpisodeOrderMapping]:
     """Matches TMDB episodes to TVDB episodes by external id, falling back to
-    normalised title + air-date within 1 day. Returns new EpisodeOrderMapping
+    unique normalised distinctive title, or title + air-date within 1 day. Returns new EpisodeOrderMapping
     instances (not yet added to any session) - shared by the full-show
     (ensure_episode_order_mapping) and incremental (ensure_episode_order_mapping_for_season)
     computations, which differ only in which episodes they pass in and how
